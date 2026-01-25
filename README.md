@@ -4,9 +4,11 @@ Generic transport layer for hosting any `Activation` (from `hub-core`) with mult
 
 ## Overview
 
-`hub-transport` extracts the transport infrastructure from Substrate into a reusable library. It allows you to host **any** activation—single plugins, Plexus hubs, or nested hubs—with WebSocket, stdio, and MCP HTTP transports using a clean builder API.
+`hub-transport` extracts the transport infrastructure from Substrate into a reusable library. It allows you to host **any** activation—single plugins, DynamicHub routers, or nested hubs—with WebSocket, stdio, and MCP HTTP transports using a clean builder API.
 
-**Key insight**: Plexus is just an Activation with routing. There's nothing transport-special about it. This library works generically with `impl Activation`.
+**Key insight**: DynamicHub (formerly Plexus) is just an Activation with dynamic registration. There's nothing transport-special about it. This library works generically with `impl Activation`.
+
+> **Note**: Examples in this README may still reference `Plexus` - this is the deprecated name for `DynamicHub` and still works but will show warnings.
 
 ## Features
 
@@ -33,26 +35,26 @@ hub-transport = { path = "../hub-transport", features = ["sqlite-sessions"] }
 
 ## Usage
 
-### Hosting a Plexus Hub
+### Hosting a DynamicHub
 
 ```rust
 use hub_transport::TransportServer;
-use substrate::build_plexus;
+use substrate::build_dynamic_hub; // or build_plexus (deprecated)
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Build Plexus hub
-    let plexus = build_plexus().await;
+    // Build DynamicHub
+    let hub = build_dynamic_hub().await;
 
     // Provide RPC converter (preserves Arc for Weak references)
-    let rpc_converter = |arc: Arc<substrate::Plexus>| {
-        substrate::Plexus::arc_into_rpc_module(arc)
+    let rpc_converter = |arc: Arc<substrate::DynamicHub>| {
+        substrate::DynamicHub::arc_into_rpc_module(arc)
             .map_err(|e| anyhow::anyhow!("{}", e))
     };
 
     // Configure and start transports
-    TransportServer::builder(plexus, rpc_converter)
+    TransportServer::builder(hub, rpc_converter)
         .with_websocket(4444)
         .with_mcp_http(4445)
         .build().await?
@@ -61,6 +63,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 ```
+
+> **Note**: `Plexus` is now `DynamicHub`. The old name still works but is deprecated.
 
 ### Hosting a Single Plugin
 
@@ -206,6 +210,8 @@ pub struct StdioConfig {
 pub struct McpHttpConfig {
     pub addr: SocketAddr,
     pub session_storage: SessionStorage,
+    pub server_name: Option<String>,  // Optional server name override
+    pub server_version: Option<String>,
 }
 ```
 
@@ -272,7 +278,7 @@ See `examples/` directory:
 **Before (substrate/src/main.rs):**
 ```rust
 // ~200 lines of transport setup code
-// Hardcoded to Plexus
+// Hardcoded to DynamicHub (formerly Plexus)
 // Duplicated across projects
 ```
 
@@ -285,7 +291,7 @@ See `examples/` directory:
 
 ## Naming Note
 
-This library references "Plexus" in examples and documentation, which is the current name for the hub/router implementation in `hub-core`. The generic concept should arguably be called "Hub" instead of "Plexus" to avoid confusion. This is a naming issue in `hub-core`, not in `hub-transport` - this library is correctly generic over the `Activation` trait and doesn't depend on the specific hub implementation name.
+In `hub-core` v0.3.0+, the hub/router implementation has been renamed from `Plexus` to `DynamicHub` to clarify the architecture. `Plexus` remains as a deprecated alias. This library (`hub-transport`) is correctly generic over the `Activation` trait and works with any activation type - whether it's a single plugin, a DynamicHub router, or a nested hub like Solar.
 
 ## License
 
