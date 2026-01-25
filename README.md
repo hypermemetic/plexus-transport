@@ -283,6 +283,10 @@ See `examples/` directory:
 // Reusable across projects
 ```
 
+## Naming Note
+
+This library references "Plexus" in examples and documentation, which is the current name for the hub/router implementation in `hub-core`. The generic concept should arguably be called "Hub" instead of "Plexus" to avoid confusion. This is a naming issue in `hub-core`, not in `hub-transport` - this library is correctly generic over the `Activation` trait and doesn't depend on the specific hub implementation name.
+
 ## License
 
 AGPL-3.0-only
