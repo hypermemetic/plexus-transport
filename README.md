@@ -112,6 +112,28 @@ TransportServer::builder(activation, rpc_converter)
     .serve().await?;
 ```
 
+### Custom Server Name (Optional)
+
+By default, MCP server reports the activation's namespace and version:
+
+```rust
+// JsExec reports as { name: "jsexec", version: "0.1.0" }
+// Plexus reports as { name: "plexus", version: "0.2.6" }
+```
+
+Override with custom name/version:
+
+```rust
+let mcp_config = McpHttpConfig::new(8889)
+    .with_server_name("my-custom-server".to_string())
+    .with_server_version("1.0.0".to_string());
+
+TransportServer::builder(activation, rpc_converter)
+    .with_mcp_http_config(mcp_config)
+    .build().await?
+    .serve().await?;
+```
+
 ### SQLite Session Persistence (Optional)
 
 ```rust

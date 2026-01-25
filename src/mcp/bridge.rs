@@ -91,11 +91,30 @@ fn plexus_to_mcp_error(e: PlexusError) -> McpError {
 /// the same MCP transport infrastructure.
 pub struct ActivationMcpBridge<A: Activation> {
     activation: Arc<A>,
+    server_name_override: Option<String>,
+    server_version_override: Option<String>,
 }
 
 impl<A: Activation> ActivationMcpBridge<A> {
     pub fn new(activation: Arc<A>) -> Self {
-        Self { activation }
+        Self {
+            activation,
+            server_name_override: None,
+            server_version_override: None,
+        }
+    }
+
+    /// Create bridge with custom server name/version
+    pub fn with_server_info(
+        activation: Arc<A>,
+        name: Option<String>,
+        version: Option<String>,
+    ) -> Self {
+        Self {
+            activation,
+            server_name_override: name,
+            server_version_override: version,
+        }
     }
 }
 
@@ -103,23 +122,34 @@ impl<A: Activation> Clone for ActivationMcpBridge<A> {
     fn clone(&self) -> Self {
         Self {
             activation: self.activation.clone(),
+            server_name_override: self.server_name_override.clone(),
+            server_version_override: self.server_version_override.clone(),
         }
     }
 }
 
 impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
     fn get_info(&self) -> ServerInfo {
+        // Use activation's namespace and version for server identity
+        // Allow override via config
+        let mut server_info = Implementation::from_build_env();
+        server_info.name = self
+            .server_name_override
+            .clone()
+            .unwrap_or_else(|| self.activation.namespace().to_string());
+        server_info.version = self
+            .server_version_override
+            .clone()
+            .unwrap_or_else(|| self.activation.version().to_string());
+
         ServerInfo {
             protocol_version: ProtocolVersion::LATEST,
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
                 .enable_logging()
                 .build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some(format!(
-                "{} - MCP server powered by hub-transport",
-                self.activation.description()
-            )),
+            server_info,
+            instructions: Some(self.activation.description().to_string()),
         }
     }
 

@@ -106,6 +106,8 @@ Generic MCP protocol handler.
 ```rust
 pub struct ActivationMcpBridge<A: Activation> {
     activation: Arc<A>,
+    server_name_override: Option<String>,
+    server_version_override: Option<String>,
 }
 
 impl<A: Activation> ServerHandler for ActivationMcpBridge<A>
@@ -117,6 +119,7 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A>
 - Routes `tools/call` to `Activation::call()`
 - Streams `PlexusStreamItem` events via MCP logging/progress notifications
 - Buffers data for final result
+- Reports server name from activation namespace (or override)
 
 **Schema transformation:**
 ```rust
@@ -300,6 +303,28 @@ SQLite opt-in for production deployments that need resumption across restarts.
 **Critical insight:** Activations may hold `Weak<Plexus>` for cross-activation calls. The Arc must stay alive.
 
 **Implementation:** Follow `Plexus::arc_into_rpc_module` pattern - store Arc in TransportServer, clone when needed, let RPC handlers keep references.
+
+### 7. Server naming from activation
+
+**Problem:** Every activation would report as "hub-transport" (the library name).
+
+**Solution:** Use activation's `namespace()` and `version()` for MCP server identity:
+
+```rust
+fn get_info(&self) -> ServerInfo {
+    let mut server_info = Implementation::from_build_env();
+    server_info.name = self.activation.namespace().to_string();
+    server_info.version = self.activation.version().to_string();
+    // ...
+}
+```
+
+**Result:**
+- JsExec reports as `{ name: "jsexec", version: "0.1.0" }`
+- Plexus reports as `{ name: "plexus", version: "0.2.6" }`
+- Custom overrides available via `McpHttpConfig`
+
+This ensures MCP clients can distinguish between different activation servers.
 
 ## Migration Impact
 

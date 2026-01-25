@@ -59,6 +59,10 @@ impl Default for StdioConfig {
 pub struct McpHttpConfig {
     pub addr: SocketAddr,
     pub session_storage: SessionStorage,
+    /// Optional override for server name (defaults to activation namespace)
+    pub server_name: Option<String>,
+    /// Optional override for server version (defaults to activation version)
+    pub server_version: Option<String>,
 }
 
 impl McpHttpConfig {
@@ -68,7 +72,21 @@ impl McpHttpConfig {
                 .parse()
                 .expect("Valid socket address"),
             session_storage: SessionStorage::default(),
+            server_name: None,
+            server_version: None,
         }
+    }
+
+    /// Override the server name reported in MCP server info
+    pub fn with_server_name(mut self, name: String) -> Self {
+        self.server_name = Some(name);
+        self
+    }
+
+    /// Override the server version reported in MCP server info
+    pub fn with_server_version(mut self, version: String) -> Self {
+        self.server_version = Some(version);
+        self
     }
 
     #[cfg(feature = "sqlite-sessions")]

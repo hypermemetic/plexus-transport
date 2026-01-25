@@ -123,7 +123,11 @@ pub async fn serve_mcp_http<A: Activation>(
 ) -> Result<JoinHandle<std::result::Result<(), std::io::Error>>> {
     tracing::info!("Starting MCP HTTP transport at http://{}/mcp", config.addr);
 
-    let bridge = ActivationMcpBridge::new(activation);
+    let bridge = ActivationMcpBridge::with_server_info(
+        activation,
+        config.server_name.clone(),
+        config.server_version.clone(),
+    );
 
     // Create session manager based on configuration
     #[cfg(feature = "sqlite-sessions")]
