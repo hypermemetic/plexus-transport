@@ -1,0 +1,37 @@
+# hub-transport Architecture Documentation
+
+This directory contains architecture decision records and design documents for hub-transport.
+
+## Documents (Reverse Chronological)
+
+- **[16677431963667456511_hub-transport-architecture.md](16677431963667456511_hub-transport-architecture.md)** (2026-01-24)
+  - Complete architecture overview
+  - Design decisions and rationale
+  - RPC conversion pattern
+  - Transport module design
+  - Migration impact analysis
+
+## Naming Convention
+
+Architecture documents use reverse-chronological naming to ensure newest documents appear first in alphabetical sorting:
+
+**Format:** `(u64::MAX - nanotime)_title.md`
+
+Where `nanotime` is the current Unix timestamp in nanoseconds. This creates a descending numeric prefix (newer = smaller number = sorts first).
+
+## Quick Reference
+
+**Core Problem:** Extract substrate's transport layer into reusable library
+**Key Insight:** Plexus is just an Activation with routing
+**Solution:** Generic TransportServer<A: Activation> with callback-based RPC conversion
+
+**Transport Types:**
+- stdio (MCP-compatible)
+- WebSocket (JSON-RPC)
+- MCP HTTP (SSE streaming)
+
+**Design Patterns:**
+- Builder pattern for configuration
+- Callback for Arc lifecycle preservation
+- Generic over Activation trait
+- In-memory sessions by default
