@@ -1,0 +1,43 @@
+[package]
+name = "hub-transport"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Core dependencies
+hub-core = { path = "../hub-core" }
+tokio = { version = "1.42", features = ["full"] }
+futures = "0.3"
+async-stream = "0.3"
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+
+# JSON-RPC and WebSocket
+jsonrpsee = { version = "0.26", features = ["server"] }
+
+# MCP protocol
+rmcp = { version = "0.12", features = ["server", "transport-streamable-http-server"] }
+
+# HTTP server
+axum = "0.8"
+
+# Optional SQLite session storage (feature-gated)
+sqlx = { version = "0.8.2", features = ["runtime-tokio-rustls", "sqlite"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
+
+# Utilities
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[features]
+default = []
+sqlite-sessions = ["sqlx", "tokio-stream"]
+
+[[example]]
+name = "jsexec_server"
+path = "examples/jsexec_server.rs"
+
+[[example]]
+name = "full_plexus"
+path = "examples/full_plexus.rs"
