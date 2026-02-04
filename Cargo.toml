@@ -2,6 +2,7 @@
 name = "hub-transport"
 version = "0.1.0"
 edition = "2021"
+description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
 
 [dependencies]
 # Core dependencies

@@ -1,10 +1,12 @@
 # hub-transport
 
-Generic transport layer for hosting any `Activation` (from `hub-core`) with multiple protocol backends.
+Transport implementations for Plexus RPC. Provides WebSocket, stdio, and HTTP/SSE backends for hosting any `Activation` (from `hub-core`).
 
 ## Overview
 
-`hub-transport` extracts the transport infrastructure from Substrate into a reusable library. It allows you to host **any** activation—single plugins, DynamicHub routers, or nested hubs—with WebSocket, stdio, and MCP HTTP transports using a clean builder API.
+`hub-transport` provides transport layer implementations for Plexus RPC servers. It extracts the transport infrastructure from Substrate into a reusable library, allowing you to host **any** activation—single plugins, DynamicHub routers, or nested hubs—with WebSocket, stdio, and MCP HTTP transports using a clean builder API.
+
+**What is Plexus RPC?** Plexus RPC is a protocol for building services with runtime schema introspection, where code IS schema. Zero drift, instant streaming.
 
 **Key insight**: DynamicHub (formerly Plexus) is just an Activation with dynamic registration. There's nothing transport-special about it. This library works generically with `impl Activation`.
 
@@ -13,7 +15,7 @@ Generic transport layer for hosting any `Activation` (from `hub-core`) with mult
 ## Features
 
 - **Generic over `Activation` trait** - Works with any type implementing `hub_core::plexus::Activation`
-- **Multiple transports simultaneously**:
+- **Multiple Plexus RPC transports simultaneously**:
   - WebSocket JSON-RPC server
   - Stdio line-delimited JSON-RPC (MCP-compatible)
   - MCP HTTP with SSE streaming
@@ -184,7 +186,7 @@ let rpc_converter = |arc: Arc<MyActivation>| {
 };
 ```
 
-This preserves the Arc lifecycle, keeping Weak references valid throughout the server's lifetime.
+This preserves the Arc lifecycle, keeping Weak references valid throughout the server's lifetime, which is essential for Plexus RPC's cross-activation communication.
 
 ## Configuration Types
 
@@ -267,11 +269,12 @@ See `examples/` directory:
 
 ## Design Goals
 
-1. **Activation-agnostic** - No special handling for Plexus vs single plugins
+1. **Activation-agnostic** - No special handling for DynamicHub vs single plugins
 2. **Arc lifecycle safety** - Preserve references for cross-activation calls
 3. **Clean API** - Builder pattern, composable configuration
 4. **MCP-first** - Full MCP protocol support with streaming
 5. **Production-ready** - Optional SQLite persistence, proper error handling
+6. **Protocol-first** - Implements Plexus RPC protocol cleanly and generically
 
 ## Comparison with Substrate
 
@@ -291,7 +294,11 @@ See `examples/` directory:
 
 ## Naming Note
 
-In `hub-core` v0.3.0+, the hub/router implementation has been renamed from `Plexus` to `DynamicHub` to clarify the architecture. `Plexus` remains as a deprecated alias. This library (`hub-transport`) is correctly generic over the `Activation` trait and works with any activation type - whether it's a single plugin, a DynamicHub router, or a nested hub like Solar.
+**Plexus RPC** is the protocol name. It's a protocol for building services with runtime schema introspection and instant streaming.
+
+**DynamicHub** (formerly called "Plexus") is a specific hub/router implementation in `hub-core` v0.3.0+ that dynamically registers activations. The old name `Plexus` remains as a deprecated alias.
+
+This library (`hub-transport`) is correctly generic over the `Activation` trait and works with any Plexus RPC activation type - whether it's a single plugin, a DynamicHub router, or a nested hub like Solar.
 
 ## License
 
@@ -299,4 +306,10 @@ AGPL-3.0-only
 
 ## Contributing
 
-This library is part of the Substrate/Plexus ecosystem. See the main Substrate repository for contribution guidelines.
+This library is part of the Plexus RPC ecosystem. See the main Substrate repository for contribution guidelines.
+
+## Learn More
+
+- **Plexus RPC Protocol**: See the protocol specification and architecture docs in the main Substrate repository
+- **Reference Server**: [Substrate](https://github.com/controlflow/substrate) - A Plexus RPC server with conversation trees and LLM orchestration
+- **Core Library**: [hub-core](https://github.com/controlflow/hub-core) - Core Plexus RPC library with Activation trait
