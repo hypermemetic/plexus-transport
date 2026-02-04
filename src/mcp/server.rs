@@ -100,7 +100,7 @@ async fn debug_handler() -> impl IntoResponse {
     tracing::info!("Debug endpoint hit");
 
     let info = r#"{
-  "server": "hub-transport",
+  "server": "plexus-transport",
   "mcp_endpoint": "/mcp",
   "mcp_protocol": "MCP Streamable HTTP (2025-03-26)",
   "notes": [

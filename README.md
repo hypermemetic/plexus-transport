@@ -29,10 +29,10 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hub-transport = { path = "../hub-transport" }
+plexus-transport = { path = "../plexus-transport" }
 
 # Optional: SQLite session persistence
-hub-transport = { path = "../hub-transport", features = ["sqlite-sessions"] }
+plexus-transport = { path = "../plexus-transport", features = ["sqlite-sessions"] }
 ```
 
 ## Usage
@@ -40,7 +40,7 @@ hub-transport = { path = "../hub-transport", features = ["sqlite-sessions"] }
 ### Hosting a DynamicHub
 
 ```rust
-use hub_transport::TransportServer;
+use plexus_transport::TransportServer;
 use substrate::build_dynamic_hub; // or build_plexus (deprecated)
 use std::sync::Arc;
 
@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
 ### Hosting a Single Plugin
 
 ```rust
-use hub_transport::TransportServer;
+use plexus_transport::TransportServer;
 use jsexec::JsExec;
 use std::sync::Arc;
 
@@ -143,7 +143,7 @@ TransportServer::builder(activation, rpc_converter)
 ### SQLite Session Persistence (Optional)
 
 ```rust
-use hub_transport::{TransportServer, McpHttpConfig, SessionStorage};
+use plexus_transport::{TransportServer, McpHttpConfig, SessionStorage};
 use std::path::PathBuf;
 
 let mcp_config = McpHttpConfig::new(8889)

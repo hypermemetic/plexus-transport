@@ -10,11 +10,11 @@
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! // Create your activation (single plugin or full Plexus hub)
+//! // Create your activation (single plugin or DynamicHub router)
 //! let activation = Arc::new(MyActivation::new());
 //!
 //! // Provide a converter function that handles Arc -> RpcModule conversion
-//! // For Plexus, this preserves the Arc for Weak references
+//! // For DynamicHub, this preserves the Arc for Weak references
 //! let rpc_converter = |arc: Arc<MyActivation>| {
 //!     MyActivation::arc_into_rpc_module(arc)
 //! };
