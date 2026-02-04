@@ -1,12 +1,12 @@
 [package]
-name = "hub-transport"
+name = "plexus-transport"
 version = "0.1.0"
 edition = "2021"
 description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
 
 [dependencies]
 # Core dependencies
-hub-core = { path = "../hub-core" }
+plexus-core = { path = "../hub-core" }
 tokio = { version = "1.42", features = ["full"] }
 futures = "0.3"
 async-stream = "0.3"
