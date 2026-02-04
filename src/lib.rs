@@ -1,7 +1,7 @@
 //! Hub Transport - Generic transport layer for Plexus activations
 //!
 //! This library provides transport adapters (WebSocket, stdio, MCP HTTP) that work
-//! with any type implementing the `Activation` trait from `hub-core`.
+//! with any type implementing the `Activation` trait from `plexus-core`.
 //!
 //! ## Example
 //!

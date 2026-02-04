@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any, Router,
 };
-use hub_core::plexus::Activation;
+use plexus_core::plexus::Activation;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };

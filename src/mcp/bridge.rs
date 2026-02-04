@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
-use hub_core::plexus::{types::PlexusStreamItem, Activation, PlexusError, PluginSchema};
+use plexus_core::plexus::{types::PlexusStreamItem, Activation, PlexusError, PluginSchema};
 use rmcp::{
     model::*,
     service::{RequestContext, RoleServer},

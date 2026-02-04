@@ -1,7 +1,7 @@
 //! Transport server builder and orchestration
 
 use anyhow::Result;
-use hub_core::plexus::Activation;
+use plexus_core::plexus::Activation;
 use jsonrpsee::server::ServerHandle;
 use jsonrpsee::RpcModule;
 use std::sync::Arc;

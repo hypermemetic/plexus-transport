@@ -1,6 +1,6 @@
 # hub-transport
 
-Transport implementations for Plexus RPC. Provides WebSocket, stdio, and HTTP/SSE backends for hosting any `Activation` (from `hub-core`).
+Transport implementations for Plexus RPC. Provides WebSocket, stdio, and HTTP/SSE backends for hosting any `Activation` (from `plexus-core`).
 
 ## Overview
 
@@ -14,7 +14,7 @@ Transport implementations for Plexus RPC. Provides WebSocket, stdio, and HTTP/SS
 
 ## Features
 
-- **Generic over `Activation` trait** - Works with any type implementing `hub_core::plexus::Activation`
+- **Generic over `Activation` trait** - Works with any type implementing `plexus_core::plexus::Activation`
 - **Multiple Plexus RPC transports simultaneously**:
   - WebSocket JSON-RPC server
   - Stdio line-delimited JSON-RPC (MCP-compatible)
@@ -312,4 +312,4 @@ This library is part of the Plexus RPC ecosystem. See the main Substrate reposit
 
 - **Plexus RPC Protocol**: See the protocol specification and architecture docs in the main Substrate repository
 - **Reference Server**: [Substrate](https://github.com/controlflow/substrate) - A Plexus RPC server with conversation trees and LLM orchestration
-- **Core Library**: [hub-core](https://github.com/controlflow/hub-core) - Core Plexus RPC library with Activation trait
+- **Core Library**: [plexus-core](https://github.com/controlflow/hub-core) - Core Plexus RPC library with Activation trait
