@@ -77,6 +77,9 @@ fn plexus_to_mcp_error(e: PlexusError) -> McpError {
             format!("Handle resolution not supported: {}", activation),
             None,
         ),
+        PlexusError::TransportError(kind) => {
+            McpError::internal_error(format!("Transport error: {:?}", kind), None)
+        }
     }
 }
 
@@ -287,6 +290,28 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
 
                 PlexusStreamItem::Done { .. } => {
                     break;
+                }
+
+                PlexusStreamItem::Request {
+                    request_id,
+                    request_data,
+                    timeout_ms,
+                } => {
+                    // Send bidirectional request to client via logging notification
+                    // Client should respond via _plexus_respond tool
+                    let _ = ctx
+                        .peer
+                        .notify_logging_message(LoggingMessageNotificationParam {
+                            level: LoggingLevel::Info,
+                            logger: Some(logger.clone()),
+                            data: json!({
+                                "type": "request",
+                                "request_id": request_id,
+                                "request_data": request_data,
+                                "timeout_ms": timeout_ms,
+                            }),
+                        })
+                        .await;
                 }
             }
         }
