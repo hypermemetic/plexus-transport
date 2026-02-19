@@ -5,8 +5,8 @@
 //!
 //! ## Example
 //!
-//! ```rust,no_run
-//! use hub_transport::TransportServer;
+//! ```rust,ignore
+//! use plexus_transport::TransportServer;
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> anyhow::Result<()> {
