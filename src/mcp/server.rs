@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 use crate::config::McpHttpConfig;
-use crate::mcp::bridge::ActivationMcpBridge;
+use crate::mcp::bridge::{ActivationMcpBridge, RouteFn};
 
 #[cfg(feature = "sqlite-sessions")]
 use crate::mcp::session::{SqliteSessionConfig, SqliteSessionManager};
@@ -117,17 +117,31 @@ async fn debug_handler() -> impl IntoResponse {
 ///
 /// Returns a JoinHandle to the server task. The server will run until
 /// the task is cancelled or encounters an error.
+///
+/// `flat_schemas` provides a pre-computed list of all schemas to expose as MCP tools.
+/// Pass `Some(hub.list_plugin_schemas())` for hub activations to expose all child schemas.
+/// Pass `None` to derive schemas from the activation's own `plugin_schema()`.
+///
+/// `route_fn` is an optional routing function for hub activations. When provided,
+/// `call_tool` uses it to dispatch namespaced method calls (e.g., "loopback.permit")
+/// to the correct child activation via `hub.route()`.
 pub async fn serve_mcp_http<A: Activation>(
     activation: Arc<A>,
+    flat_schemas: Option<Vec<plexus_core::plexus::PluginSchema>>,
+    route_fn: Option<RouteFn>,
     config: McpHttpConfig,
 ) -> Result<JoinHandle<std::result::Result<(), std::io::Error>>> {
     tracing::info!("Starting MCP HTTP transport at http://{}/mcp", config.addr);
 
-    let bridge = ActivationMcpBridge::with_server_info(
+    let mut bridge = ActivationMcpBridge::with_server_info_and_schemas(
         activation,
         config.server_name.clone(),
         config.server_version.clone(),
+        flat_schemas,
     );
+    if let Some(router) = route_fn {
+        bridge = bridge.with_router(router);
+    }
 
     // Create session manager based on configuration
     #[cfg(feature = "sqlite-sessions")]
