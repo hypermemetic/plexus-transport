@@ -3,16 +3,28 @@
 //! This module implements the MCP protocol using the rmcp crate,
 //! bridging MCP tool calls to activation methods.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use plexus_core::plexus::{types::PlexusStreamItem, Activation, PlexusError, PluginSchema};
+use plexus_core::plexus::{types::PlexusStreamItem, Activation, PlexusError, PlexusStream, PluginSchema};
 use rmcp::{
     model::*,
     service::{RequestContext, RoleServer},
     ErrorData as McpError, ServerHandler,
 };
 use serde_json::json;
+
+/// A function that routes a namespaced method call (e.g., "loopback.permit") to the
+/// correct activation. Used by hub activations to dispatch child calls via `hub.route()`.
+///
+/// Signature: `fn(method: String, params: Value) -> Future<Output = Result<PlexusStream, PlexusError>>`
+pub type RouteFn = Arc<
+    dyn Fn(String, serde_json::Value) -> Pin<Box<dyn Future<Output = Result<PlexusStream, PlexusError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 // =============================================================================
 // Schema Transformation
@@ -94,16 +106,38 @@ fn plexus_to_mcp_error(e: PlexusError) -> McpError {
 /// the same MCP transport infrastructure.
 pub struct ActivationMcpBridge<A: Activation> {
     activation: Arc<A>,
+    /// Pre-computed flat list of all schemas to expose as MCP tools.
+    /// When set, this is used instead of deriving schemas from `plugin_schema()`.
+    /// Allows hubs to expose all child activation schemas (e.g., loopback, claudecode).
+    flat_schemas: Option<Arc<Vec<PluginSchema>>>,
     server_name_override: Option<String>,
     server_version_override: Option<String>,
+    /// Optional routing function for hub activations.
+    /// When set, `call_tool` uses this to dispatch namespaced calls (e.g., "loopback.permit")
+    /// via `hub.route()` instead of stripping the namespace and calling `activation.call()`.
+    router: Option<RouteFn>,
 }
 
 impl<A: Activation> ActivationMcpBridge<A> {
     pub fn new(activation: Arc<A>) -> Self {
         Self {
             activation,
+            flat_schemas: None,
             server_name_override: None,
             server_version_override: None,
+            router: None,
+        }
+    }
+
+    /// Create bridge with a pre-computed flat schema list.
+    /// Use this for hub activations to expose all child schemas as MCP tools.
+    pub fn with_flat_schemas(activation: Arc<A>, schemas: Vec<PluginSchema>) -> Self {
+        Self {
+            activation,
+            flat_schemas: Some(Arc::new(schemas)),
+            server_name_override: None,
+            server_version_override: None,
+            router: None,
         }
     }
 
@@ -115,9 +149,36 @@ impl<A: Activation> ActivationMcpBridge<A> {
     ) -> Self {
         Self {
             activation,
+            flat_schemas: None,
             server_name_override: name,
             server_version_override: version,
+            router: None,
         }
+    }
+
+    /// Create bridge with custom server name/version and pre-computed schemas
+    pub fn with_server_info_and_schemas(
+        activation: Arc<A>,
+        name: Option<String>,
+        version: Option<String>,
+        schemas: Option<Vec<PluginSchema>>,
+    ) -> Self {
+        Self {
+            activation,
+            flat_schemas: schemas.map(|s| Arc::new(s)),
+            server_name_override: name,
+            server_version_override: version,
+            router: None,
+        }
+    }
+
+    /// Set the routing function used in `call_tool` for dispatching namespaced method calls.
+    ///
+    /// Hub activations should provide a function that wraps `hub.route()` so that
+    /// calls like "loopback.permit" are dispatched to the correct child activation.
+    pub fn with_router(mut self, router: RouteFn) -> Self {
+        self.router = Some(router);
+        self
     }
 }
 
@@ -125,8 +186,10 @@ impl<A: Activation> Clone for ActivationMcpBridge<A> {
     fn clone(&self) -> Self {
         Self {
             activation: self.activation.clone(),
+            flat_schemas: self.flat_schemas.clone(),
             server_name_override: self.server_name_override.clone(),
             server_version_override: self.server_version_override.clone(),
+            router: self.router.clone(),
         }
     }
 }
@@ -161,10 +224,15 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
         _request: Option<PaginatedRequestParam>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        // Get schema from the activation
-        let schema = self.activation.plugin_schema();
-        let tools = schemas_to_rmcp_tools(vec![schema]);
+        // Use pre-computed flat schemas if available (set for hub activations).
+        // Otherwise fall back to single activation schema.
+        let schemas = if let Some(ref flat) = self.flat_schemas {
+            flat.as_ref().clone()
+        } else {
+            vec![self.activation.plugin_schema()]
+        };
 
+        let tools = schemas_to_rmcp_tools(schemas);
         tracing::debug!("Listing {} tools", tools.len());
 
         Ok(ListToolsResult {
@@ -193,19 +261,25 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
         // Logger name: namespace.method (e.g., bash.execute)
         let logger = method_name.to_string();
 
-        // Extract method name (remove namespace prefix if present)
-        let method = if method_name.contains('.') {
-            method_name.split('.').nth(1).unwrap_or(method_name)
+        // Call activation and get stream.
+        // If a router is available (hub activations), use it to dispatch the full
+        // namespaced method name (e.g., "loopback.permit") to the correct child.
+        // Otherwise strip the namespace prefix and call activation directly.
+        let stream = if let Some(ref router) = self.router {
+            router(method_name.to_string(), arguments)
+                .await
+                .map_err(plexus_to_mcp_error)?
         } else {
-            method_name
+            let method = if method_name.contains('.') {
+                method_name.split('.').nth(1).unwrap_or(method_name)
+            } else {
+                method_name
+            };
+            self.activation
+                .call(method, arguments)
+                .await
+                .map_err(plexus_to_mcp_error)?
         };
-
-        // Call activation and get stream
-        let stream = self
-            .activation
-            .call(method, arguments)
-            .await
-            .map_err(plexus_to_mcp_error)?;
 
         // Stream events via notifications AND buffer for final result
         let mut had_error = false;

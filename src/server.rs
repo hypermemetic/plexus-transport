@@ -1,13 +1,14 @@
 //! Transport server builder and orchestration
 
 use anyhow::Result;
-use plexus_core::plexus::Activation;
+use plexus_core::plexus::{Activation, PluginSchema};
 use jsonrpsee::server::ServerHandle;
 use jsonrpsee::RpcModule;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 use crate::config::{McpHttpConfig, StdioConfig, TransportConfig, WebSocketConfig};
+use crate::mcp::bridge::RouteFn;
 use crate::mcp::server::serve_mcp_http;
 use crate::stdio::serve_stdio;
 use crate::websocket::serve_websocket;
@@ -28,6 +29,12 @@ pub struct TransportServer<A: Activation> {
     activation: Arc<A>,
     config: TransportConfig,
     rpc_converter: Option<RpcConverter<A>>,
+    /// Pre-computed flat schema list for MCP tool exposure.
+    /// When set, the MCP bridge exposes all listed schemas as tools.
+    mcp_flat_schemas: Option<Vec<PluginSchema>>,
+    /// Optional routing function for hub activations.
+    /// When set, MCP call_tool uses it to dispatch namespaced calls via hub.route().
+    mcp_route_fn: Option<RouteFn>,
 }
 
 impl<A: Activation> TransportServer<A> {
@@ -73,7 +80,7 @@ impl<A: Activation> TransportServer<A> {
         // Start MCP HTTP transport
         let mcp_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> =
             if let Some(mcp_config) = self.config.mcp_http {
-                Some(serve_mcp_http(self.activation.clone(), mcp_config).await?)
+                Some(serve_mcp_http(self.activation.clone(), self.mcp_flat_schemas.take(), self.mcp_route_fn.take(), mcp_config).await?)
             } else {
                 None
             };
@@ -121,6 +128,8 @@ pub struct TransportServerBuilder<A: Activation> {
     activation: Arc<A>,
     config: TransportConfig,
     rpc_converter: Option<RpcConverter<A>>,
+    mcp_flat_schemas: Option<Vec<PluginSchema>>,
+    mcp_route_fn: Option<RouteFn>,
 }
 
 impl<A: Activation> TransportServerBuilder<A> {
@@ -132,6 +141,8 @@ impl<A: Activation> TransportServerBuilder<A> {
             activation,
             config: TransportConfig::default(),
             rpc_converter: Some(Box::new(rpc_converter)),
+            mcp_flat_schemas: None,
+            mcp_route_fn: None,
         }
     }
 
@@ -159,12 +170,29 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
+    /// Set pre-computed flat schemas for MCP tool exposure.
+    /// For hub activations, pass `hub.list_plugin_schemas()` to expose all child schemas.
+    pub fn with_mcp_flat_schemas(mut self, schemas: Vec<PluginSchema>) -> Self {
+        self.mcp_flat_schemas = Some(schemas);
+        self
+    }
+
+    /// Set routing function for MCP call_tool dispatch.
+    /// For hub activations, provide a closure wrapping `hub.route()` so that
+    /// namespaced tool calls (e.g., "loopback.permit") reach the correct child.
+    pub fn with_mcp_route_fn(mut self, route_fn: RouteFn) -> Self {
+        self.mcp_route_fn = Some(route_fn);
+        self
+    }
+
     /// Build the transport server
     pub async fn build(self) -> Result<TransportServer<A>> {
         Ok(TransportServer {
             activation: self.activation,
             config: self.config,
             rpc_converter: self.rpc_converter,
+            mcp_flat_schemas: self.mcp_flat_schemas,
+            mcp_route_fn: self.mcp_route_fn,
         })
     }
 }

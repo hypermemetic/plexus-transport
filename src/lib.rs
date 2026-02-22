@@ -50,3 +50,5 @@ pub use mcp::{bridge::ActivationMcpBridge, session::SqliteSessionManager};
 
 #[cfg(not(feature = "sqlite-sessions"))]
 pub use mcp::bridge::ActivationMcpBridge;
+
+pub use mcp::bridge::RouteFn;
