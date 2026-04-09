@@ -11,7 +11,7 @@ Implement AUTH-18 (Origin header validation) using the `PlexusRequest` derive (R
 
 ## Why Not Middleware, and Why Not a Standalone Extractor
 
-The original REQ-1 design used `#[from_request(require_allowed_origin(ALLOWED_ORIGINS))] _: ValidOrigin` — a standalone extractor function passed as an expression argument. That design is gone. With `PlexusRequest` derive, the approach is different: the struct field type itself carries the validation logic. This is consistent with how Axum extractors work and easier to compose.
+The original REQ-1 design used `#[activation_param(require_allowed_origin(ALLOWED_ORIGINS))] _: ValidOrigin` — a standalone extractor function passed as an expression argument. That design is gone. With `PlexusRequest` derive, the approach is different: the struct field type itself carries the validation logic. This is consistent with how Axum extractors work and easier to compose.
 
 ## Shape
 

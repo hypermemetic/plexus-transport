@@ -250,7 +250,7 @@ renderRpcError _ msg = "Error: " <> msg
 ## Non-Changes
 
 - **Origin validation**: Synapse does not send an `Origin` header. The `ValidOrigin` extraction passes for absent origin. No synapse change needed for CORS.
-- **`#[from_request]` params on methods**: Stripped by the macro from the RPC schema. Synapse never sees them as method parameters.
+- **`#[activation_param]` params on methods**: Stripped by the macro from the RPC schema. Synapse never sees them as method parameters.
 - **Cookie format**: The existing `cookieHeader` logic sends `access_token=<jwt>`. Unchanged — it becomes one of the `soCookies` entries.
 - **`SYNAPSE_TOKEN`**: Kept as-is, treated as alias for `SYNAPSE_COOKIE_ACCESS_TOKEN`. Not deprecated.
 
@@ -276,7 +276,7 @@ renderRpcError _ msg = "Error: " <> msg
 - [ ] `SYNAPSE_COOKIE_ACCESS_TOKEN=<jwt> synapse backend clients list` authenticates successfully
 - [ ] `synapse backend forms list` (no `psRequest`) unaffected — no auth notice shown
 - [ ] Origin (CORS): synapse sends no Origin header, `ValidOrigin` passes, no change needed
-- [ ] `#[from_request]` fields do not appear in synapse's method parameter help (stripped by macro)
+- [ ] `#[activation_param]` fields do not appear in synapse's method parameter help (stripped by macro)
 - [ ] Wire schema `request` field is an opaque JSON Schema blob — no Rust type strings, no `SecurityExtractor`, no `ContractEntry`
 - [ ] Old backends without `request` field in `PluginSchema` are handled gracefully (`psRequest = Nothing`)
 
@@ -436,7 +436,7 @@ SYNAPSE_COOKIE_ACCESS_TOKEN=<valid-jwt> synapse backend clients list
 synapse --token <valid-jwt> backend clients list
   exit code 0   (server has origin: ValidOrigin in request struct)
 
--- Method params stripped: #[from_request] fields absent from help:
+-- Method params stripped: #[activation_param] fields absent from help:
 synapse --token <valid-jwt> backend clients list --help
   stdout must NOT contain "auth_token" as a parameter name
   stdout must NOT contain "peer_addr" as a parameter name

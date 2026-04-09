@@ -1,4 +1,4 @@
-# REQ-4: Hub-Level Request Declaration
+# REQ-4: Activation-Level Request Declaration
 
 **blocked_by:** [REQ-2]
 **unlocks:** [REQ-5]
@@ -7,23 +7,23 @@
 
 ## Goal
 
-Declare the request shape once on the hub, not on every method. The `request = Type` argument to `hub_methods` defines the security posture and extraction contract for the entire activation — readable at a glance, enforced uniformly, visible in the wire schema.
+Declare the request shape once on the activation, not on every method. The `request = Type` argument to `plexus::activation` defines the security posture and extraction contract for the entire activation — readable at a glance, enforced uniformly, visible in the wire schema.
 
 ## Problem
 
-With REQ-2, a method that needs auth + origin checking still requires per-method `#[from_request]` annotations. With a hub serving 5-10 methods that all share the same request shape, that's repetitive. More importantly, forgetting `#[from_request] auth_token: String` on a new method produces silent misbehavior: the method runs with no auth gate at all.
+With REQ-2, a method that needs auth + origin checking still requires per-method `#[activation_param]` annotations. With an activation serving 5-10 methods that all share the same request shape, that's repetitive. More importantly, forgetting `#[activation_param] auth_token: String` on a new method produces silent misbehavior: the method runs with no auth gate at all.
 
-The hub annotation should declare what every method in the hub sees on upgrade. Methods opt into individual fields via `#[from_request]` only if they need the value — but the extraction and validation happen uniformly, before any method runs.
+The activation annotation should declare what every method in the activation sees on upgrade. Methods opt into individual fields via `#[activation_param]` only if they need the value — but the extraction and validation happen uniformly, before any method runs.
 
 ## Shape
 
 ```rust
-// Defined once — the request shape for this hub
+// Defined once — the request shape for this activation
 #[derive(PlexusRequest, schemars::JsonSchema)]
 struct ClientsRequest {
     /// JWT from Keycloak auth flow
     #[from_cookie("access_token")]
-    auth_token: String,           // required: extraction failure = every method in hub fails
+    auth_token: String,           // required: extraction failure = every method in activation fails
 
     origin: ValidOrigin,          // ValidOrigin::extract_from_raw validates allowlist
 
@@ -34,57 +34,61 @@ struct ClientsRequest {
     auth: Option<AuthContext>,    // populated by CombinedAuthMiddleware
 }
 
-#[hub_methods(
+#[plexus::activation(
     namespace = "clients",
     version = "1.0.0",
-    request = ClientsRequest,    // ← hub-level default; all methods use this
+    request = ClientsRequest,    // ← activation-level default; all methods use this
 )]
 impl ClientsActivation {
     async fn list(
         &self,
-        #[from_request] auth_token: String,              // opt into auth_token field
+        #[activation_param] auth_token: String,              // opt into auth_token field
         #[from_auth(self.db.validate_user)] user: ValidUser,   // stage-3 sugar unchanged
         search: Option<String>,
     ) -> impl Stream<Item = ClientEvent> + Send + 'static { ... }
 
     async fn get(
         &self,
-        #[from_request] auth_token: String,
+        #[activation_param] auth_token: String,
         id: String,
     ) -> impl Stream<Item = ClientEvent> + Send + 'static { ... }
 
-    // Public method within an authenticated hub:
-    #[hub_method(request = ())]
+    // Public method within an authenticated activation:
+    #[plexus::method(request = ())]
     async fn health(&self) -> impl Stream<Item = String> { stream! { yield "ok".into(); } }
 }
 ```
 
 ## Semantics
 
-### Hub-level extraction
+### Activation-level extraction
 
-Before any method in the hub is dispatched:
+Before any method in the activation is dispatched:
 
 1. `ClientsRequest::extract(&raw_ctx)?` is called
 2. If extraction fails (e.g. `auth_token` cookie absent, or `ValidOrigin` validation fails), the error is returned immediately — the method body never runs
 3. The extracted struct is held for the duration of the dispatch call
 
-Methods then use `#[from_request] field_name: Type` to pull values from the struct. Methods that don't use `#[from_request]` are still protected by extraction failure — they just don't receive any field values.
+Methods then use `#[activation_param] field_name: Type` to pull values from the struct. Methods that don't use `#[activation_param]` are still protected by extraction failure — they just don't receive any field values.
 
-This means `auth_token: String` on `ClientsRequest` is effectively a hub-wide auth gate. No per-method `#[from_request] auth_token` needed to get the protection — but methods that need the token value must opt in.
+This means `auth_token: String` on `ClientsRequest` is effectively an activation-wide auth gate. No per-method `#[activation_param] auth_token` needed to get the protection — but methods that need the token value must opt in.
 
-### Per-method override: `#[hub_method(request = ())]`
+### Naming rationale: why `#[activation_param]`
 
-Use `()` as the request type for public methods within an otherwise-authenticated hub:
+The `ClientsRequest` struct is extracted **once at activation dispatch time**, before routing to individual methods. `#[activation_param]` on a method parameter accesses that activation-level value — it is not performing extraction itself, just reading a field that was already extracted. The attribute is named after the activation, not the method, because the extraction is an activation-level concept.
+
+### Per-method override: `#[plexus::method(request = ())]`
+
+Use `()` as the request type for public methods within an otherwise-authenticated activation:
 
 ```rust
-#[hub_method(request = ())]
+#[plexus::method(request = ())]
 async fn health(&self) -> impl Stream<Item = String> { ... }
 ```
 
-This tells the macro to skip `ClientsRequest::extract` for `health` and call it directly. The method cannot use `#[from_request]` (there's no struct to pull from), but it's callable without any cookies.
+This tells the macro to skip `ClientsRequest::extract` for `health` and call it directly. The method cannot use `#[activation_param]` (there's no struct to pull from), but it's callable without any cookies.
 
-Custom per-method request type is also allowed: `#[hub_method(request = PublicRequest)]` where `PublicRequest: PlexusRequest`.
+Custom per-method request type is also allowed: `#[plexus::method(request = PublicRequest)]` where `PublicRequest: PlexusRequest`.
 
 ### Validators are gone
 
@@ -101,11 +105,11 @@ The old `extract = [peer_addr: Option<SocketAddr> = extract_peer_addr]` syntax i
 
 - `#[from_peer] peer_addr: Option<SocketAddr>` on the struct
 
-No separate extractor registry or `#[from_hub]` opt-in name needed. Methods opt in by declaring `#[from_request] peer_addr: Option<SocketAddr>`.
+No separate extractor registry or activation-level opt-in name needed. Methods opt in by declaring `#[activation_param] peer_addr: Option<SocketAddr>`.
 
 ## Codegen
 
-The `hub_methods` macro receives `request = ClientsRequest` and generates a dispatch wrapper per method:
+The `plexus::activation` macro receives `request = ClientsRequest` and generates a dispatch wrapper per method:
 
 ```rust
 async fn __dispatch_list(
@@ -113,12 +117,12 @@ async fn __dispatch_list(
     params: Value,
     raw_ctx: Option<Arc<RawRequestContext>>,
 ) -> PlexusStream {
-    // Stage 1: extract request struct (hub-level default)
+    // Stage 1: extract request struct (activation-level default)
     let ctx = raw_ctx.as_deref().ok_or(PlexusError::Unauthenticated("no request context".into()))?;
     let req = ClientsRequest::extract(ctx)?;   // extraction failure short-circuits here
 
-    // Stage 2: inject #[from_request] fields
-    let auth_token: String = req.auth_token.clone();    // #[from_request] auth_token
+    // Stage 2: inject #[activation_param] fields
+    let auth_token: String = req.auth_token.clone();    // #[activation_param] auth_token
 
     // Stage 3: resolve #[from_auth] params
     let auth_ref = req.auth.as_ref()
@@ -133,7 +137,7 @@ async fn __dispatch_list(
     self.list(auth_token, user, search).await
 }
 
-// Public method with #[hub_method(request = ())] — no extraction
+// Public method with #[plexus::method(request = ())] — no extraction
 async fn __dispatch_health(
     &self,
     params: Value,
@@ -145,7 +149,7 @@ async fn __dispatch_health(
 
 ## Schema
 
-The `plugin_schema()` method now includes a `request` field — the JSON Schema of the hub's request struct:
+The `plugin_schema()` method now includes a `request` field — the JSON Schema of the activation's request struct:
 
 ```rust
 fn plugin_schema(&self) -> PluginSchema {
@@ -198,31 +202,31 @@ Wire example:
 
 | File | Repo | Change |
 |------|------|--------|
-| `plexus-macros/src/parse.rs` | plexus-macros | Parse `request = Type` in `hub_methods` attr; parse `#[hub_method(request = Type)]` override |
+| `plexus-macros/src/parse.rs` | plexus-macros | Parse `request = Type` in `plexus::activation` attr; parse `#[plexus::method(request = Type)]` override |
 | `plexus-macros/src/codegen/activation.rs` | plexus-macros | Generate `RequestType::extract(ctx)?` at top of each dispatch; skip for `request = ()` methods |
 | `plexus-macros/src/codegen/schema.rs` | plexus-macros | Include `schemars::schema_for!(RequestType)` in `plugin_schema()` output |
 | `plexus-core/src/schema.rs` | plexus-core | Add `request: Option<Value>` to `PluginSchema` Rust struct |
-| `plexus-transport/src/request/mod.rs` | plexus-transport | `PlexusRequest` trait; hub dispatch infrastructure |
+| `plexus-transport/src/request/mod.rs` | plexus-transport | `PlexusRequest` trait; activation dispatch infrastructure |
 | `FormVeritasV2/src/auth/clients_request.rs` | FormVeritas | `ClientsRequest` struct (new file) |
-| `FormVeritasV2/src/activations/clients/activation.rs` | FormVeritas | Add `request = ClientsRequest` to hub; remove per-method validator/extractor annotations |
+| `FormVeritasV2/src/activations/clients/activation.rs` | FormVeritas | Add `request = ClientsRequest` to activation; remove per-method validator/extractor annotations |
 
 ## Acceptance Criteria
 
-- [ ] Hub with `request = ClientsRequest` where `auth_token: String` rejects unauthenticated calls (no cookie) for every method without per-method annotations
-- [ ] Hub with `origin: ValidOrigin` in request struct rejects wrong-Origin calls for every method
-- [ ] `#[hub_method(request = ())]` makes a specific method public within an authenticated hub
-- [ ] `#[from_request] auth_token: String` in a method body injects the correct value
+- [ ] Activation with `request = ClientsRequest` where `auth_token: String` rejects unauthenticated calls (no cookie) for every method without per-method annotations
+- [ ] Activation with `origin: ValidOrigin` in request struct rejects wrong-Origin calls for every method
+- [ ] `#[plexus::method(request = ())]` makes a specific method public within an authenticated activation
+- [ ] `#[activation_param] auth_token: String` in a method body injects the correct value
 - [ ] Method schema includes `request` field (JSON Schema of the request struct)
 - [ ] `required` in the `request` schema matches non-Option fields on `ClientsRequest`
 - [ ] `x-plexus-source` annotations present in the `request` schema
-- [ ] Existing hubs with no `request` annotation compile unchanged
+- [ ] Existing activations with no `request` annotation compile unchanged
 - [ ] `cargo test` passes in plexus-macros and FormVeritas
 
 ## Tests
 
 ### Compile tests — `plexus-macros/tests/compile/` (trybuild)
 
-**`hub_request_type.rs`** — must compile:
+**`activation_request_type.rs`** — must compile:
 ```rust
 #[derive(PlexusRequest, schemars::JsonSchema)]
 struct TestRequest {
@@ -230,66 +234,66 @@ struct TestRequest {
     auth_token: String,
 }
 
-#[hub_methods(namespace = "test", request = TestRequest)]
+#[plexus::activation(namespace = "test", request = TestRequest)]
 impl TestHub {
     async fn list(&self) -> impl Stream<Item = String> { stream! { yield "ok".into(); } }
     async fn get(&self, id: String) -> impl Stream<Item = String> { stream! { yield id; } }
 }
-// Neither method uses #[from_request] but both are protected by extraction
+// Neither method uses #[activation_param] but both are protected by extraction
 ```
 
-**`hub_request_public_override.rs`** — must compile:
+**`activation_request_public_override.rs`** — must compile:
 ```rust
-#[hub_methods(namespace = "test", request = TestRequest)]
+#[plexus::activation(namespace = "test", request = TestRequest)]
 impl TestHub {
-    async fn protected(&self, #[from_request] auth_token: String) -> ... { ... }
+    async fn protected(&self, #[activation_param] auth_token: String) -> ... { ... }
 
-    #[hub_method(request = ())]
+    #[plexus::method(request = ())]
     async fn health(&self) -> impl Stream<Item = String> { stream! { yield "ok".into(); } }
 }
 ```
 
-**`hub_no_request_unchanged.rs`** — existing hub with no `request` arg must compile identically:
+**`activation_no_request_unchanged.rs`** — existing activation with no `request` arg must compile identically:
 ```rust
-#[hub_methods(namespace = "test", version = "1.0.0")]
+#[plexus::activation(namespace = "test", version = "1.0.0")]
 impl TestHub {
     async fn plain(&self, x: i32) -> impl Stream<Item = i32> { stream! { yield x; } }
 }
 ```
 
-**`hub_request_field_type_mismatch.rs`** — must FAIL:
+**`activation_request_field_type_mismatch.rs`** — must FAIL:
 ```rust
 // TestRequest has auth_token: String
-#[hub_methods(namespace = "test", request = TestRequest)]
+#[plexus::activation(namespace = "test", request = TestRequest)]
 impl TestHub {
-    async fn bad(&self, #[from_request] auth_token: u32) -> ... { ... }
+    async fn bad(&self, #[activation_param] auth_token: u32) -> ... { ... }
     // Expected: type error — auth_token is String, not u32
 }
 ```
 
-### Unit — dispatch tests (plexus-macros/tests/hub_dispatch.rs)
+### Unit — dispatch tests (plexus-macros/tests/activation_dispatch.rs)
 
 Using test server with `TestSessionValidator`:
 
 ```
 // Extraction gate:
-// Hub uses TestRequest with auth_token: String (required cookie)
+// Activation uses TestRequest with auth_token: String (required cookie)
 // Unauthenticated request (no cookie) → any method returns -32001 before body runs
 // Authenticated request (cookie present) → method executes normally
 
 // ValidOrigin gate:
-// Hub uses request struct with origin: ValidOrigin
+// Activation uses request struct with origin: ValidOrigin
 // Disallowed Origin → extraction fails → method returns -32001 with "Origin" in message
 // No Origin (CLI path) → extraction succeeds (ValidOrigin("")) → method runs
 
 // Per-method public override:
-// Hub has request = TestRequest with required auth_token
-// health() has #[hub_method(request = ())]
+// Activation has request = TestRequest with required auth_token
+// health() has #[plexus::method(request = ())]
 // Call health() without cookie → succeeds (skip extraction)
 // Call list() without cookie → fails (extraction runs, cookie absent)
 
 // Field injection:
-// Method has #[from_request] auth_token: String
+// Method has #[activation_param] auth_token: String
 // Client sends cookie access_token=tok123
 // Method receives auth_token == "tok123"
 ```
@@ -320,12 +324,12 @@ Using test server with `TestSessionValidator`:
 
 ### Integration — FormVeritas ClientsActivation
 
-After applying REQ-4 to `ClientsActivation` (removing old `validate`/`extract` from hub annotation, adding `request = ClientsRequest`):
+After applying REQ-4 to `ClientsActivation` (removing old `validate`/`extract` from activation annotation, adding `request = ClientsRequest`):
 
 ```
 // All 99 Playwright tests must still pass
 // Unauthenticated websocat call to clients.list → -32001
 // websocat with wrong Origin → -32001 with "Origin" in message
-// clients hub schema includes "request" JSON Schema blob with x-plexus-source fields
+// clients activation schema includes "request" JSON Schema blob with x-plexus-source fields
 // No per-method auth or origin annotation needed on any of the 5 client methods
 ```

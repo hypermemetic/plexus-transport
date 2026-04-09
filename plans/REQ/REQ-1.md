@@ -1,5 +1,6 @@
 # REQ-1: `PlexusRequest` Derive — Typed HTTP Upgrade Request as First-Class Input
 
+**blocked_by:** [REQ-0]
 **epic:** REQ
 **unlocks:** [REQ-2, REQ-3, REQ-4]
 
@@ -84,21 +85,21 @@ struct ClientsRequest {
 
 **Custom extractor fallback:** For exotic cases where an annotation isn't enough, use `#[from_request(my_fn)]` where `my_fn: fn(&RawRequestContext) -> Result<T, PlexusError>`. The macro calls `my_fn(ctx)?` and skips schema source annotation (treated as `x-plexus-source: derived`).
 
-### Layer 3 — `#[from_request]` on method params (plexus-macros)
+### Layer 3 — `#[activation_param]` on method params (plexus-macros)
 
-After the hub extracts its `RequestStruct`, individual method params annotated with `#[from_request]` pull named fields from that struct:
+This is an activation-level concept. The request struct is extracted once at activation dispatch time, before routing to individual methods. After the activation extracts its `RequestStruct`, individual method params annotated with `#[activation_param]` pull named fields from that already-extracted struct:
 
 ```rust
 async fn list(
     &self,
-    #[from_request] auth_token: String,    // pulls ClientsRequest::auth_token
+    #[activation_param] auth_token: String,    // pulls ClientsRequest::auth_token
     search: Option<String>,                // normal RPC param
 ) -> impl Stream<Item = ClientEvent> { ... }
 ```
 
-The param name must match a field name in the hub's request struct. Type must match. Mismatch = compile error.
+The param name must match a field name in the activation's request struct. Type must match. Mismatch = compile error.
 
-No expr argument — the extraction is defined on the struct, not on the method param. `#[from_request]` is a field accessor, not an extractor.
+No expr argument — the extraction is defined on the struct, not on the method param. `#[activation_param]` is a field accessor, not an extractor. The naming reflects that this is an activation-level concept — the extraction happens at activation dispatch time, and the method is simply accessing a value that was already extracted.
 
 ### Layer 4 — `#[from_auth(expr)]` unchanged (plexus-macros)
 
@@ -107,7 +108,7 @@ Reads `auth: Option<AuthContext>` from the extracted request struct (the `#[from
 ```rust
 async fn list(
     &self,
-    #[from_request] auth_token: String,
+    #[activation_param] auth_token: String,
     #[from_auth(self.db.validate_user)] user: ValidUser,  // unchanged
     search: Option<String>,
 ) -> ...
@@ -168,7 +169,7 @@ Note: standalone extractor functions (`extract_origin`, `extract_cookie`, etc.),
 - [ ] `required` array in schema output matches non-Option fields only
 - [ ] `#[from_auth(expr)]` continues to work unchanged (backward compatible)
 - [ ] `RawRequestContext` is available in Extensions after any WS connection (authenticated or not)
-- [ ] No headers are cloned for connections that don't use a `PlexusRequest` hub
+- [ ] No headers are cloned for connections that don't use a `PlexusRequest` activation
 
 ## Tests
 
@@ -299,14 +300,14 @@ struct AuthedRequest {
 
 ### Integration — Extensions wiring (`plexus-transport/tests/integration.rs`)
 
-Start a test server with `TestSessionValidator`. Connect a client. Call a method that uses `#[from_request]`.
+Start a test server with `TestSessionValidator`. Connect a client. Call a method that uses `#[activation_param]`.
 
 ```
-// echo_origin method uses #[from_request] origin: Option<String>
+// echo_origin method uses #[activation_param] origin: Option<String>
 // Case 1: WS upgrade with Origin header → method returns Some("http://test.local")
 // Case 2: WS upgrade without Origin header → method returns None
 // Case 3: authenticated client → req struct has populated auth field
-// Case 4: unauthenticated client + hub with required auth_token field → call returns -32001
+// Case 4: unauthenticated client + activation with required auth_token field → call returns -32001
 ```
 
 ## Open Design Questions
@@ -321,4 +322,4 @@ Yes: `#[from_request(my_fn)]` where `my_fn: fn(&RawRequestContext) -> Result<T, 
 
 **Q3: Should `PlexusRequest` be a trait or a generated inherent impl?**
 
-Trait. Defining `trait PlexusRequest: schemars::JsonSchema` allows hub dispatch code to be generic over `R: PlexusRequest`, enables mocking in tests, and allows per-method override (`#[hub_method(request = ())]` uses `NoRequest: PlexusRequest`).
+Trait. Defining `trait PlexusRequest: schemars::JsonSchema` allows activation dispatch code to be generic over `R: PlexusRequest`, enables mocking in tests, and allows per-method override (`#[plexus::method(request = ())]` uses `NoRequest: PlexusRequest`).

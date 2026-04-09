@@ -1,4 +1,4 @@
-# REQ-2: Macro — `#[from_request]` Field Injection and `#[from_auth]` Compatibility
+# REQ-2: Macro — `#[activation_param]` Field Injection and `#[from_auth]` Compatibility
 
 **blocked_by:** [REQ-1]
 **unlocks:** [REQ-3, REQ-4]
@@ -7,39 +7,39 @@
 
 ## Goal
 
-Wire the `PlexusRequest` derive (REQ-1) into the macro dispatch layer. `#[from_request]` on a method param means "inject this named field from the hub's already-extracted request struct." No resolver expression — the extraction is defined on the struct. Keep `#[from_auth(expr)]` working exactly as today.
+Wire the `PlexusRequest` derive (REQ-1) into the macro dispatch layer. `#[activation_param]` on a method param means "inject this named field from the activation's already-extracted request struct." This is an activation-level concept: the request struct is extracted once at activation dispatch time, and the method is simply accessing a value that was already extracted. No resolver expression — the extraction is defined on the struct. Keep `#[from_auth(expr)]` working exactly as today.
 
 ## How It Differs From the Old Approach
 
-The original design had `#[from_request(expr)]` where the expression was an extractor function receiving `&RequestContext`. That design is gone. The new design is:
+The original design had `#[activation_param(expr)]` where the expression was an extractor function receiving `&RequestContext`. That design is gone. The new design is:
 
 - Extraction logic lives on the **request struct** (field annotations: `#[from_cookie]`, `#[from_header]`, etc.)
-- `#[from_request]` on a method param is just a **field accessor** — it pulls a named field from the already-extracted struct
-- No expr argument on `#[from_request]`
+- `#[activation_param]` on a method param is just a **field accessor** — it pulls a named field from the already-extracted struct. The "activation" in the name reflects that the extraction happens at activation dispatch time, not at the method level.
+- No expr argument on `#[activation_param]`
 - `#[from_auth(expr)]` stays exactly as today — reads the `auth` field from the extracted struct, runs the resolver
 
-The macro doesn't need to understand extractors at all. By the time `#[from_request]` runs, the struct is already extracted hub-side.
+The macro doesn't need to understand extractors at all. By the time `#[activation_param]` runs, the struct is already extracted activation-side.
 
-## `#[from_request]` Semantics
+## `#[activation_param]` Semantics
 
 ```rust
-#[hub_methods(namespace = "clients", request = ClientsRequest)]
+#[plexus::activation(namespace = "clients", request = ClientsRequest)]
 impl ClientsActivation {
     async fn list(
         &self,
-        #[from_request] auth_token: String,    // pulls ClientsRequest::auth_token
-        #[from_request] peer_addr: Option<SocketAddr>,  // pulls ClientsRequest::peer_addr
+        #[activation_param] auth_token: String,    // pulls ClientsRequest::auth_token
+        #[activation_param] peer_addr: Option<SocketAddr>,  // pulls ClientsRequest::peer_addr
         search: Option<String>,                // normal RPC param
     ) -> impl Stream<Item = ClientEvent> { ... }
 }
 ```
 
 Rules:
-- The param name must match a field name in the hub's declared request struct type
+- The param name must match a field name in the activation's declared request struct type
 - The param type must match the field type in the request struct
 - Name not found in struct → compile error with message naming the missing field
 - Type mismatch → compile error
-- `#[from_request]` params are stripped from the RPC method schema (invisible to clients, same as `#[from_auth]`)
+- `#[activation_param]` params are stripped from the RPC method schema (invisible to clients, same as `#[from_auth]`)
 
 ## `#[from_auth(expr)]` Semantics (Unchanged)
 
@@ -49,19 +49,19 @@ Rules:
 
 Codegen reads `req_struct.auth` (the `#[from_auth_context]` field on the request struct), passes it to `expr`, awaits if async. Unchanged from today except the source is `req_struct.auth` instead of a bare `Arc<AuthContext>` from Extensions.
 
-`from_auth` does NOT need to change to a `from_request` field accessor. It's a different concept: it runs an async resolver expression and produces a domain type. `from_request` just does a field copy.
+`from_auth` does NOT need to change to an `activation_param` field accessor. It's a different concept: it runs an async resolver expression and produces a domain type. `activation_param` just does a field copy.
 
 ## Parse Changes (`plexus-macros/src/parse.rs`)
 
 ```rust
 pub enum MethodParam {
     Normal(syn::FnArg),
-    FromRequest { field_name: Ident, ty: Type },   // #[from_request]
+    ActivationParam { field_name: Ident, ty: Type },   // #[activation_param]
     FromAuth { param_name: Ident, ty: Type, resolver: Expr },  // #[from_auth(expr)]
 }
 ```
 
-- `#[from_request]` attribute — no arguments. Parse the param name and type. Record as `FromRequest`.
+- `#[activation_param]` attribute — no arguments. Parse the param name and type. Record as `ActivationParam`.
 - `#[from_auth(expr)]` attribute — parse expr argument. Unchanged.
 - Both are stripped from the RPC trait method signature.
 
@@ -76,13 +76,13 @@ async fn __dispatch_list(
     params: Value,
     raw_ctx: Option<Arc<RawRequestContext>>,
 ) -> PlexusStream {
-    // Stage 1: extract request struct (generated by hub_methods macro, see REQ-4)
+    // Stage 1: extract request struct (generated by plexus::activation macro, see REQ-4)
     let ctx = raw_ctx.as_deref().ok_or(PlexusError::Unauthenticated("no request context".into()))?;
     let req = ClientsRequest::extract(ctx)?;
 
-    // Stage 2: inject #[from_request] fields
-    let auth_token: String = req.auth_token.clone();       // #[from_request] auth_token
-    let peer_addr: Option<SocketAddr> = req.peer_addr;     // #[from_request] peer_addr
+    // Stage 2: inject #[activation_param] fields
+    let auth_token: String = req.auth_token.clone();       // #[activation_param] auth_token
+    let peer_addr: Option<SocketAddr> = req.peer_addr;     // #[activation_param] peer_addr
 
     // Stage 3: resolve #[from_auth] params
     let auth_ref = req.auth.as_ref()
@@ -98,14 +98,14 @@ async fn __dispatch_list(
 }
 ```
 
-The macro knows the hub's request struct type from `#[hub_methods(request = ClientsRequest)]`. It uses the type name to generate `ClientsRequest::extract(ctx)?` and field accesses. Compile-time checks on field name/type come from the fact that the generated code is Rust — if `req.auth_token` is `String` and the method param declares `u32`, `rustc` reports the type error.
+The macro knows the activation's request struct type from `#[plexus::activation(request = ClientsRequest)]`. It uses the type name to generate `ClientsRequest::extract(ctx)?` and field accesses. Compile-time checks on field name/type come from the fact that the generated code is Rust — if `req.auth_token` is `String` and the method param declares `u32`, `rustc` reports the type error.
 
 ## Compile-Time Field Validation
 
 The macro can optionally emit an explicit check using a helper trait:
 
 ```rust
-// Generated for each #[from_request] param:
+// Generated for each #[activation_param] param:
 const _: () = {
     fn _check_field_exists(req: &ClientsRequest) -> &String {
         &req.auth_token  // fails to compile if field doesn't exist or type doesn't match
@@ -113,31 +113,31 @@ const _: () = {
 };
 ```
 
-This gives an error at macro expansion time (during compilation) pointing at the `#[from_request]` site rather than deep inside generated code.
+This gives an error at macro expansion time (during compilation) pointing at the `#[activation_param]` site rather than deep inside generated code.
 
 ## Backward Compatibility
 
 - All existing `#[from_auth(expr)]` usages compile and behave identically
 - No changes required in consumer crates for existing code
-- `#[from_request]` (no arguments) is purely additive
-- The old `#[from_request(expr)]` pattern (with expression arg) is NOT supported — if someone somehow has it, they'll get a parse error with a message explaining the new form
+- `#[activation_param]` (no arguments) is purely additive
+- The old `#[activation_param(expr)]` pattern (with expression arg) is NOT supported — if someone somehow has it, they'll get a parse error with a message explaining the new form
 
 ## Files
 
 | File | Repo | Change |
 |------|------|--------|
-| `plexus-macros/src/parse.rs` | plexus-macros | Add `MethodParam::FromRequest`, update attribute parsing |
-| `plexus-macros/src/codegen/activation.rs` | plexus-macros | Generate field injection for `FromRequest`; keep `FromAuth` codegen unchanged |
+| `plexus-macros/src/parse.rs` | plexus-macros | Add `MethodParam::ActivationParam`, update attribute parsing |
+| `plexus-macros/src/codegen/activation.rs` | plexus-macros | Generate field injection for `ActivationParam`; keep `FromAuth` codegen unchanged |
 | `plexus-core/src/plexus/plexus.rs` | plexus-core | Pass `Arc<RawRequestContext>` (from REQ-1) to dispatch; drop bare `Arc<AuthContext>` threading |
 
 ## Acceptance Criteria
 
-- [ ] `#[from_request] auth_token: String` on a method param compiles and injects the correct value at call time
-- [ ] `#[from_request] nonexistent_field: String` (field not in hub's request struct) fails at compile time with a clear error message
-- [ ] `#[from_request] auth_token: u32` when field is `String` fails at compile time with a type mismatch error
+- [ ] `#[activation_param] auth_token: String` on a method param compiles and injects the correct value at call time
+- [ ] `#[activation_param] nonexistent_field: String` (field not in activation's request struct) fails at compile time with a clear error message
+- [ ] `#[activation_param] auth_token: u32` when field is `String` fails at compile time with a type mismatch error
 - [ ] `#[from_auth(self.db.validate_user)]` continues to work unchanged
-- [ ] A method can mix `#[from_request]` and `#[from_auth]` params
-- [ ] `#[from_request]` params are stripped from the RPC method schema
+- [ ] A method can mix `#[activation_param]` and `#[from_auth]` params
+- [ ] `#[activation_param]` params are stripped from the RPC method schema
 - [ ] Generated code does not clone `RawRequestContext` (moves or borrows field values from the extracted struct)
 - [ ] `cargo test` passes in plexus-macros
 
@@ -145,7 +145,7 @@ This gives an error at macro expansion time (during compilation) pointing at the
 
 ### Compile tests — `plexus-macros/tests/compile/` (trybuild)
 
-**`from_request_field_injection.rs`** — must compile:
+**`activation_param_field_injection.rs`** — must compile:
 ```rust
 #[derive(PlexusRequest, schemars::JsonSchema)]
 struct TestRequest {
@@ -155,44 +155,44 @@ struct TestRequest {
     origin: Option<String>,
 }
 
-#[hub_methods(namespace = "test", request = TestRequest)]
+#[plexus::activation(namespace = "test", request = TestRequest)]
 impl TestHub {
     async fn echo(
         &self,
-        #[from_request] auth_token: String,
-        #[from_request] origin: Option<String>,
+        #[activation_param] auth_token: String,
+        #[activation_param] origin: Option<String>,
     ) -> impl Stream<Item = String> {
         stream! { yield format!("{} {:?}", auth_token, origin); }
     }
 }
 ```
 
-**`from_request_field_name_mismatch.rs`** — must FAIL with clear error:
+**`activation_param_field_name_mismatch.rs`** — must FAIL with clear error:
 ```rust
-#[hub_methods(namespace = "test", request = TestRequest)]
+#[plexus::activation(namespace = "test", request = TestRequest)]
 impl TestHub {
     async fn bad(
         &self,
-        #[from_request] nonexistent: String,   // ← field not in TestRequest
+        #[activation_param] nonexistent: String,   // ← field not in TestRequest
     ) -> impl Stream<Item = String> { stream! { yield "x".into(); } }
 }
 // Expected: compile error mentioning "nonexistent" not found in TestRequest
 ```
 
-**`from_request_type_mismatch.rs`** — must FAIL with type error:
+**`activation_param_type_mismatch.rs`** — must FAIL with type error:
 ```rust
-#[hub_methods(namespace = "test", request = TestRequest)]
+#[plexus::activation(namespace = "test", request = TestRequest)]
 impl TestHub {
     async fn bad(
         &self,
-        #[from_request] auth_token: u32,  // ← field is String, not u32
+        #[activation_param] auth_token: u32,  // ← field is String, not u32
     ) -> impl Stream<Item = String> { stream! { yield "x".into(); } }
 }
 ```
 
 **`from_auth_still_works.rs`** — must compile (backward compat):
 ```rust
-#[hub_methods(namespace = "test", request = TestRequest)]
+#[plexus::activation(namespace = "test", request = TestRequest)]
 impl TestHub {
     async fn authed(
         &self,
@@ -201,22 +201,22 @@ impl TestHub {
 }
 ```
 
-**`mixed_from_request_and_from_auth.rs`** — must compile:
+**`mixed_activation_param_and_from_auth.rs`** — must compile:
 ```rust
-#[hub_methods(namespace = "test", request = TestRequest)]
+#[plexus::activation(namespace = "test", request = TestRequest)]
 impl TestHub {
     async fn mixed(
         &self,
-        #[from_request] auth_token: String,
+        #[activation_param] auth_token: String,
         #[from_auth(self.db.validate_user)] user: ValidUser,
         name: String,
     ) -> impl Stream<Item = String> { stream! { yield name; } }
 }
 ```
 
-**`from_request_stripped_from_schema.rs`** — the RPC trait must not include `#[from_request]` params:
+**`activation_param_stripped_from_schema.rs`** — the RPC trait must not include `#[activation_param]` params:
 ```rust
-// Hub has method: fn echo(&self, #[from_request] auth_token: String, name: String)
+// Hub has method: fn echo(&self, #[activation_param] auth_token: String, name: String)
 // Generated RPC trait must have: fn echo(&self, name: String)
 // Verify: generated schema for echo lists only "name" as a parameter
 ```
@@ -226,20 +226,20 @@ impl TestHub {
 Using a test server with `TestSessionValidator` and the stub hub above:
 
 ```
-// #[from_request] auth_token — cookie present:
+// #[activation_param] auth_token — cookie present:
 // Client connects with Cookie: access_token=jwt123
 // Calls echo(name = "hello")
 // Response contains "jwt123"
 
-// #[from_request] origin — header present:
+// #[activation_param] origin — header present:
 // Client connects with Origin: http://test.local
 // Response contains "http://test.local"
 
-// #[from_request] origin — header absent:
+// #[activation_param] origin — header absent:
 // Response contains "None"
 
 // Required field missing (auth_token, no cookie):
-// Hub extraction fails before method → error code -32001
+// Activation extraction fails before method → error code -32001
 
 // #[from_auth] — no token:
 // Client connects without token
