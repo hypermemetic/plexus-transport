@@ -1,4 +1,4 @@
-# REQ-5: Synapse Support for Hub-Level Security Declarations
+# REQ-5: Synapse Support for Hub Request Schemas
 
 **blocked_by:** [REQ-4]
 **unlocks:** []
@@ -8,196 +8,150 @@
 
 ## Goal
 
-Synapse should understand hub-level security declarations from REQ-4 — showing auth requirements in help output, proactively erroring when credentials are missing, and falling back gracefully when a `-32001` comes back. It already has token forwarding machinery; this connects it to the schema.
+Synapse reads the `psRequest` JSON Schema blob from `PluginSchema`, shows auth requirements and request fields in help output, proactively warns when required fields aren't configured, and provides `--cookie`/`--header`/`--query` flags and environment variable shorthands to satisfy those requirements. The wire format change is minimal: one new field (`request: Maybe Value`) on `PluginSchema`.
 
-## Current State
+## What Changes in the Wire Format
 
-Synapse already does the right thing at the wire level:
+### `plexus-protocol` — Add `psRequest` to `PluginSchema`
 
-- `--token <jwt>` or `--token-file <path>` → sent as `Cookie: access_token=<jwt>` on WS upgrade
-- Token file fallback at `~/.plexus/tokens/<backend>`
-- `SYNAPSE_TOKEN` env var: **not implemented** (only the CLI flag and file exist)
-
-What it does not do:
-
-- **Schema**: `PluginSchema` has no `security` field. Hub-level `validate`/`extract` declarations (REQ-4) have nowhere to go in the wire protocol.
-- **IR**: `irPlugins` maps `namespace → [method_names]`. No plugin-level metadata slot.
-- **-32001 handling**: Authentication errors are rendered as generic `"Error: ..."` — no special message, no hint to use `--token`.
-- **Help**: `renderSchema` does not show whether a hub requires authentication or what cookies/headers it needs.
-- **Proactive check**: Synapse doesn't know before calling a method that it will fail with -32001.
-- **Generic flags**: No `--cookie`, `--header`, or `--query` flags for satisfying arbitrary request contracts.
-
-## Changes Required
-
-### 1. `plexus-protocol` — Add `PluginSecurity` with `ContractEntry` to `PluginSchema`
-
-The Haskell protocol types are the source of truth for the wire schema. The `security` field exposes a **request contract** — a client-facing description of what HTTP-level data the hub needs on WS upgrade. This is NOT Rust type information; it's transport-level routing information.
+The Haskell protocol types are the source of truth for the wire schema. The only change is adding one optional field:
 
 ```haskell
 -- Plexus/Schema/Recursive.hs
 
-data SecurityValidator = SecurityValidator
-  { svName   :: Text          -- e.g. "require_authenticated", "require_cors"
-  , svParams :: Maybe Value   -- optional JSON params, e.g. ["https://app.example.com"]
-  } deriving (Show, Eq, Generic)
-
-instance FromJSON SecurityValidator
-instance ToJSON SecurityValidator
-
--- Where the client must put the data on WS upgrade.
--- Derived = computed from network state server-side; client cannot supply it.
-data ContractSource
-  = ContractCookie      -- read from Cookie header
-  | ContractHeader      -- read from an HTTP header
-  | ContractQueryParam  -- read from URI query string
-  | ContractDerived     -- computed server-side (peer_addr, etc.)
-  deriving (Show, Eq, Generic)
-
-instance FromJSON ContractSource
-instance ToJSON ContractSource
-
--- One entry per HTTP-level input the hub's extractors need from the client.
-data ContractEntry = ContractEntry
-  { ceSource      :: ContractSource
-  , ceKey         :: Maybe Text      -- header/cookie/param name; Nothing for Derived
-  , ceRequired    :: Bool
-  , ceDescription :: Text
-  } deriving (Show, Eq, Generic)
-
-instance FromJSON ContractEntry
-instance ToJSON ContractEntry
-
-data PluginSecurity = PluginSecurity
-  { psValidators      :: [SecurityValidator]
-  , psRequestContract :: [ContractEntry]    -- what the client must send on WS upgrade
-  } deriving (Show, Eq, Generic)
-
-instance FromJSON PluginSecurity
-instance ToJSON PluginSecurity
-
--- In PluginSchema, add:
 data PluginSchema = PluginSchema
-  { ...existing fields...
-  , psSecurity :: Maybe PluginSecurity   -- Nothing = no security declarations
-  }
+  { psNamespace   :: Text
+  , psVersion     :: Text
+  , psDescription :: Text
+  , psMethods     :: [MethodSchema]
+  , psHash        :: Text
+  -- NEW:
+  , psRequest     :: Maybe Value
+    -- JSON Schema of the hub's PlexusRequest struct, or Nothing if no request shape.
+    -- Fields annotated with x-plexus-source describe where the client should put data.
+  } deriving (Show, Eq, Generic)
+
+instance FromJSON PluginSchema where
+  parseJSON = withObject "PluginSchema" $ \o -> PluginSchema
+    <$> o .: "namespace"
+    <*> o .: "version"
+    <*> o .: "description"
+    <*> o .: "methods"
+    <*> o .: "hash"
+    <*> o .:? "request"   -- optional: old servers without REQ-4 send Nothing
+
+instance ToJSON PluginSchema
 ```
 
-`SecurityExtractor` (the old `{ seName, seTypeName }` form with Rust type strings) is removed entirely. Rust type names are meaningless to Haskell clients and don't tell clients where to put data.
+That's it. `ContractEntry`, `ContractSource`, `SecurityValidator`, `SecurityExtractor`, `PluginSecurity` — none of these are added to the Haskell types. The wire format for request requirements IS the JSON Schema of the Rust struct, passed as an opaque `Value`. Synapse reads it directly.
 
-On the Rust side, `plexus-core` serializes `PluginSchema` when responding to schema requests — add the `security` field to the Rust `PluginSchema` struct and populate it from the hub's `validate`/`extract` macro declarations (see REQ-4 Codegen section for how the macro infers `ContractEntry` per extractor).
+Removed from plexus-protocol (if they existed as draft types): `SecurityExtractor` (the old `{ seName, seTypeName }` form with Rust type strings). Rust type names in the wire schema were never correct.
 
-Wire format example:
+On the Rust side (`plexus-core`): add `request: Option<Value>` to the `PluginSchema` struct and populate it from `schemars::schema_for!(RequestType)` in `plugin_schema()`.
 
-```json
-{
-  "security": {
-    "validators": [
-      {"name": "require_authenticated"},
-      {"name": "require_cors", "params": ["https://app.formveritas.com"]}
-    ],
-    "request_contract": [
-      {"source": "Cookie", "key": "access_token", "required": true,  "description": "JWT auth token"},
-      {"source": "Header", "key": "origin",       "required": false, "description": "Origin header for CORS"},
-      {"source": "Derived", "key": null,           "required": false, "description": "server-derived: extract_peer_addr"}
-    ]
-  }
-}
-```
+## Synapse Changes
 
-### 2. `synapse/src/Synapse/IR/Types.hs` — Add `PluginMeta`
+### 1. `synapse/src/Synapse/IR/Types.hs` — Add `PluginMeta`
 
 ```haskell
 data PluginMeta = PluginMeta
   { pmDescription :: Text
   , pmVersion     :: Text
-  , pmSecurity    :: Maybe PluginSecurity
+  , pmRequest     :: Maybe Value   -- JSON Schema of hub's request struct; Nothing = no shape
   } deriving (Show, Eq, Generic)
 
 data IR = IR
-  { ...existing fields...
-  , irPluginMeta :: Map Text PluginMeta   -- namespace → metadata
+  { irTypes      :: Map TypeHash IRType
+  , irMethods    :: Map MethodPath IRMethod
+  , irPluginMeta :: Map Text PluginMeta   -- namespace → metadata (NEW)
   }
 
 emptyIR :: IR
-emptyIR = IR { ...existing..., irPluginMeta = Map.empty }
+emptyIR = IR { irTypes = Map.empty, irMethods = Map.empty, irPluginMeta = Map.empty }
 ```
 
-### 3. `synapse/src/Synapse/IR/Builder.hs` — Populate in `irAlgebra`
+### 2. `synapse/src/Synapse/IR/Builder.hs` — Populate in `irAlgebra`
 
-In the `PluginF schema path childIRs` branch, capture security metadata:
+In the `PluginF schema path childIRs` branch:
 
 ```haskell
 irAlgebra (PluginF schema path childIRs) = do
   let namespace = T.intercalate "." path
-  let meta = PluginMeta
+      meta = PluginMeta
         { pmDescription = psDescription schema
         , pmVersion     = psVersion schema
-        , pmSecurity    = psSecurity schema
+        , pmRequest     = psRequest schema
         }
-  pure $ IR { ...existing...
-    , irPluginMeta = Map.insert namespace meta (irPluginMeta childIR)
+  pure $ IR
+    { irTypes      = mergedTypes
+    , irMethods    = mergedMethods
+    , irPluginMeta = Map.insert namespace meta (foldMap irPluginMeta childIRs)
     }
 ```
 
-### Request Contract Philosophy
+### 3. `synapse/src/Synapse/Algebra/Render.hs` — Request schema in help
 
-The `request_contract` field is client-facing, not type-facing. It answers the question "what do I need to send?" not "what Rust type does the server produce?".
-
-- `ContractEntry { source: Cookie, key: "access_token", required: true }` → synapse sends `Cookie: access_token=<value>` on WS upgrade
-- `ContractEntry { source: Header, key: "origin", required: false }` → synapse may send `Origin: <value>` if configured
-- `ContractEntry { source: Derived }` → synapse cannot supply this; it's computed server-side (peer address, etc.)
-
-ContractEntries are derived from the extractor stdlib at macro-expansion time (see REQ-4 for the inference rules). The server processes the raw request internally — the contract is only for clients to understand what to send.
-
-Validators like `require_authenticated` don't directly produce ContractEntries, but `require_authenticated` implies a Cookie entry for `access_token` because that's what the auth middleware reads. This is the one case where a validator drives a contract entry. Other validators (`require_cors`) are purely server-side gates — the origin header is a browser concern, not a synapse concern.
-
-### 4. `synapse/src/Synapse/Algebra/Render.hs` — Show request contract in help
-
-When rendering a plugin's help (`renderSchema`), show the request contract if present:
+Synapse walks the `psRequest` JSON Schema to build the help output. The `x-plexus-source` extension field on each property tells synapse what it is and where it comes from.
 
 ```haskell
-renderContractSource :: ContractSource -> Text
-renderContractSource ContractCookie     = "Cookie"
-renderContractSource ContractHeader     = "Header"
-renderContractSource ContractQueryParam = "QueryParam"
-renderContractSource ContractDerived    = "Server-derived"
+-- Walk the request schema's properties and render each field
+renderRequestSchema :: Value -> Text
+renderRequestSchema schema =
+  let props    = fromMaybe Map.empty (schema ^? key "properties" . _Object)
+      required = fromMaybe [] (schema ^? key "required" . _Array
+                   <&> V.toList <&> mapMaybe (^? _String))
+      entries  = Map.toList props
+  in if null entries then ""
+     else "Request requirements:\n" <> T.unlines (map (renderRequestField required) entries)
 
-renderContractEntry :: ContractEntry -> Text
-renderContractEntry e =
-  "  " <> renderContractSource (ceSource e)
-       <> maybe "" (" " <>) (ceKey e)
-       <> (if ceRequired e then " (required)" else " (optional)")
-       <> ": " <> ceDescription e
+renderRequestField :: [Text] -> (Text, Value) -> Text
+renderRequestField required (name, propSchema) =
+  let source    = propSchema ^? key "x-plexus-source"
+      fromVal   = source >>= (^? key "from" . _String)
+      keyVal    = source >>= (^? key "key" . _String)
+      isReq     = name `elem` required
+      isDerived = fromVal == Just "derived"
+      desc      = fromMaybe "" (propSchema ^? key "description" . _String)
+      label     = case fromVal of
+        Just "cookie"  -> "Cookie"
+        Just "header"  -> "Header"
+        Just "query"   -> "QueryParam"
+        Just "derived" -> "Server-derived"
+        _              -> "Unknown"
+      keyPart   = maybe "" (" " <>) keyVal
+      reqPart   = if isReq && not isDerived then " (required)" else " (optional)"
+  in "  " <> label <> keyPart <> reqPart
+     <> (if T.null desc then "" else ": " <> desc)
 
-renderRequestContract :: [ContractEntry] -> Text
-renderRequestContract [] = ""
-renderRequestContract entries =
-  "Request requirements:\n" <> T.unlines (map renderContractEntry entries)
-
-renderPluginSecurity :: PluginSecurity -> Text
-renderPluginSecurity sec =
-  let validators = map svName (psValidators sec)
-      authNotice = if "require_authenticated" `elem` validators
-                   then "Authentication required (use --token <jwt> or SYNAPSE_TOKEN)\n\n"
-                   else ""
-      contractBlock = renderRequestContract (psRequestContract sec)
-  in authNotice <> contractBlock
-
-renderSchema :: PluginSchema -> Text
-renderSchema schema =
-  let secBlock = maybe "" renderPluginSecurity (psSecurity schema)
-  in secBlock <> ...existing render logic...
+renderPluginHelp :: PluginSchema -> IR -> Text
+renderPluginHelp schema ir =
+  let reqBlock = maybe "" renderRequestSchema (psRequest schema)
+      authLine  = case psRequest schema of
+        Nothing -> ""
+        Just s  ->
+          let required = fromMaybe [] (s ^? key "required" . _Array
+                            <&> V.toList <&> mapMaybe (^? _String))
+              props    = fromMaybe Map.empty (s ^? key "properties" . _Object)
+              hasCookieAuth = any (\n ->
+                let src = Map.lookup n props >>= (^? key "x-plexus-source")
+                in (src >>= (^? key "from" . _String)) == Just "cookie"
+                && (src >>= (^? key "key" . _String)) == Just "access_token"
+                && n `elem` required) required
+          in if hasCookieAuth
+             then "Authentication required (use --cookie access_token=<jwt>, --token <jwt>, or SYNAPSE_TOKEN)\n\n"
+             else ""
+  in authLine <> reqBlock <> "\n" <> ...existing method render...
 ```
 
 Example output for the `clients` hub:
 
 ```
-Authentication required (use --token <jwt> or SYNAPSE_TOKEN)
+Authentication required (use --cookie access_token=<jwt>, --token <jwt>, or SYNAPSE_TOKEN)
 
 Request requirements:
-  Cookie access_token (required): JWT auth token
-  Header origin (optional): Origin header for CORS
-  Server-derived (optional): server-derived: extract_peer_addr
+  Cookie access_token (required): JWT from Keycloak auth flow
+  Header origin (optional)
+  Server-derived (optional): Caller IP address
 
 Methods:
   list    List clients
@@ -205,178 +159,201 @@ Methods:
   ...
 ```
 
-### 5. `synapse/app/Main.hs` — Generic contract flags + `SYNAPSE_TOKEN` + -32001 hint
-
-**Add `--cookie`/`--header`/`--query` flags** for satisfying arbitrary request contracts:
+### 4. `synapse/app/Main.hs` — `--cookie`/`--header`/`--query` flags and env vars
 
 ```haskell
 data SynapseOpts = SynapseOpts
-  { ...existing...
-  , soCookies :: [(Text, Text)]    -- --cookie key=value (parsed as "key=value")
-  , soHeaders :: [(Text, Text)]    -- --header key=value
-  , soQuery   :: [(Text, Text)]    -- --query key=value (appended to WS upgrade URI)
+  { soHost     :: Text
+  , soPort     :: Int
+  , soToken    :: Maybe Text
+  , soTokenFile :: Maybe FilePath
+  , soJson     :: Bool
+  -- NEW:
+  , soCookies  :: [(Text, Text)]    -- --cookie key=value pairs
+  , soHeaders  :: [(Text, Text)]    -- --header key=value pairs
+  , soQuery    :: [(Text, Text)]    -- --query key=value pairs (appended to WS upgrade URI)
   }
 
 -- Parsing: --cookie access_token=<jwt> → ("access_token", "<jwt>")
--- Multiple --cookie flags are accumulated as a list.
+-- Multiple --cookie flags accumulate. key=value must contain exactly one '='.
 
--- Env var support (checked at startup, merged before building the request):
--- SYNAPSE_COOKIE_<UPPERCASE_KEY> → added to soCookies automatically
--- SYNAPSE_HEADER_<UPPERCASE_KEY> → added to soHeaders automatically
+-- Env var scanning at startup:
+-- SYNAPSE_COOKIE_<KEY> → added to soCookies as ("key_lowercase", value)
+-- SYNAPSE_HEADER_<KEY> → added to soHeaders as ("key_lowercase", value)
+-- SYNAPSE_TOKEN        → treated as sugar for SYNAPSE_COOKIE_ACCESS_TOKEN (alias, not deprecated)
 
--- In buildRequest / cookieHeader:
--- Merge soCookies + existing --token (which becomes access_token cookie) into Cookie header
--- Add soHeaders as extra WS upgrade request headers
--- Add soQuery params to the WS upgrade URI query string
+-- Token resolution priority:
+-- 1. --token flag
+-- 2. --token-file
+-- 3. SYNAPSE_TOKEN env var
+-- 4. SYNAPSE_COOKIE_ACCESS_TOKEN env var
+-- 5. ~/.plexus/tokens/<backend>
+-- All paths produce a cookie entry: ("access_token", <token>)
+
+-- Building WS upgrade request:
+-- Cookie header = merge all soCookies entries (plus token → access_token)
+-- Extra headers = soHeaders entries added to WS upgrade request
+-- Query string  = soQuery entries appended to the WS upgrade URI
 ```
 
-**Add `SYNAPSE_TOKEN`** to `resolveToken`:
+### 5. `synapse/src/Synapse/Algebra/Navigate.hs` — Proactive contract check
+
+After schema fetch and before method invocation, warn if required request fields aren't provided:
 
 ```haskell
-resolveToken :: SynapseOpts -> Text -> IO (Maybe Text)
-resolveToken opts backend =
-  case soToken opts of
-    Just tok -> pure (Just tok)
-    Nothing -> do
-      mEnvTok <- fmap (fmap T.pack) (lookupEnv "SYNAPSE_TOKEN")
-      case mEnvTok of
-        Just tok -> pure (Just tok)
-        Nothing -> ...existing file lookup...
-```
-
-Priority: `--token` → `--token-file` → `SYNAPSE_TOKEN` → `SYNAPSE_COOKIE_ACCESS_TOKEN` → `~/.plexus/tokens/<backend>`
-
-**Intercept -32001 in error rendering**:
-
-```haskell
--- In printResult or the StreamError handler:
-renderError :: SynapseError -> Text
-renderError (RpcError (-32001) msg _) =
-  "Authentication required: " <> msg <>
-  "\nUse --token <jwt>, --token-file <path>, set SYNAPSE_TOKEN, or --cookie access_token=<jwt>."
-renderError err = ...existing...
-```
-
-### 6. `synapse/src/Synapse/Algebra/Navigate.hs` — Proactive contract check
-
-After fetching a schema during navigation, check the request contract against configured data:
-
-```haskell
-ensureContractSatisfied :: PluginSchema -> SynapseM ()
-ensureContractSatisfied schema =
-  case psSecurity schema of
+checkRequestSatisfied :: PluginSchema -> SynapseEnv -> IO ()
+checkRequestSatisfied schema env =
+  case psRequest schema of
     Nothing -> pure ()
-    Just sec -> do
-      mTok  <- asks seToken
-      cookies <- asks seCookies
-      headers <- asks seHeaders
-      let contract = psRequestContract sec
-      forM_ contract $ \entry ->
-        when (ceRequired entry && ceSource entry /= ContractDerived) $ do
-          let satisfied = case ceSource entry of
-                ContractCookie ->
-                  -- access_token covered by --token; other cookies from seCookies
-                  maybe False (\k -> k == "access_token" && isJust mTok
-                                  || any ((== k) . fst) cookies)
-                              (ceKey entry)
-                ContractHeader ->
-                  maybe False (\k -> any ((== k) . fst) headers) (ceKey entry)
-                ContractQueryParam ->
-                  True  -- query params always optional in practice; skip for now
-                ContractDerived -> True
-          unless satisfied $
-            liftIO $ TIO.hPutStrLn stderr $
-              "Warning: hub requires " <> renderContractSource (ceSource entry) <>
-              maybe "" (" " <>) (ceKey entry) <>
-              " but none is configured."
+    Just reqSchema ->
+      let props    = fromMaybe Map.empty (reqSchema ^? key "properties" . _Object)
+          required = fromMaybe [] (reqSchema ^? key "required" . _Array
+                       <&> V.toList <&> mapMaybe (^? _String))
+      in forM_ required $ \fieldName -> do
+           let propSchema = Map.lookup fieldName props
+               source     = propSchema >>= (^? key "x-plexus-source")
+               fromVal    = source >>= (^? key "from" . _String)
+               keyVal     = source >>= (^? key "key" . _String)
+               isDerived  = fromVal == Just "derived"
+           unless isDerived $ do
+             let satisfied = case fromVal of
+                   Just "cookie" ->
+                     let k = fromMaybe fieldName keyVal
+                     in k == "access_token" && isJust (seToken env)
+                        || any ((== k) . fst) (seCookies env)
+                   Just "header" ->
+                     let k = fromMaybe fieldName keyVal
+                     in any ((== k) . fst) (seHeaders env)
+                   Just "query"  -> True  -- not proactively checked in v1
+                   _             -> True
+             unless satisfied $
+               hPutStrLn stderr $
+                 "Warning: hub requires "
+                 <> maybe (T.unpack fieldName) T.unpack keyVal
+                 <> " (" <> maybe "unknown" T.unpack fromVal <> ")"
+                 <> " but none is configured."
 ```
 
-This is a warning, not a hard failure — the actual rejection comes from the server. The check runs before invoking a method, not when showing help.
+This is a warning, not a hard failure. The server rejects the call if the field is truly absent.
 
-## Non-Changes (Already Correct)
+### 6. Error rendering — -32001 hint
 
-- **Origin validation**: Synapse does not send an `Origin` header (it's not a browser). The `require_cors` validator's `None` arm allows non-browser clients through. No synapse change needed for CORS.
-- **Extractor parameters** (`#[from_hub]`): Hub extractors (`peer_addr`, `origin`) that a method opts into via `#[from_hub]` are stripped from the RPC schema by the macro — same as `#[from_auth]`. Synapse never sees them as parameters. No change needed.
-- **Cookie format**: The existing `cookieHeader` sends `access_token=<jwt>` which matches what `CombinedAuthMiddleware` looks for.
+```haskell
+-- In error rendering:
+renderRpcError :: Int -> Text -> Text
+renderRpcError (-32001) msg =
+  "Authentication required: " <> msg <> "\n"
+  <> "Use --token <jwt>, --cookie access_token=<jwt>, or set SYNAPSE_TOKEN."
+renderRpcError _ msg = "Error: " <> msg
+```
+
+## Non-Changes
+
+- **Origin validation**: Synapse does not send an `Origin` header. The `ValidOrigin` extraction passes for absent origin. No synapse change needed for CORS.
+- **`#[from_request]` params on methods**: Stripped by the macro from the RPC schema. Synapse never sees them as method parameters.
+- **Cookie format**: The existing `cookieHeader` logic sends `access_token=<jwt>`. Unchanged — it becomes one of the `soCookies` entries.
+- **`SYNAPSE_TOKEN`**: Kept as-is, treated as alias for `SYNAPSE_COOKIE_ACCESS_TOKEN`. Not deprecated.
 
 ## File Summary
 
 | File | Repo | Change |
 |------|------|--------|
-| `src/Plexus/Schema/Recursive.hs` | plexus-protocol | Add `PluginSecurity`, `SecurityValidator`, `ContractEntry`, `ContractSource`; add `psSecurity` to `PluginSchema`; remove `SecurityExtractor` |
-| `src/plexus/plexus.rs` (or schema serialization) | plexus-core | Serialize `security` field in `PluginSchema` JSON from hub macro declarations; use `request_contract` array of `ContractEntry`, not Rust type strings |
+| `src/Plexus/Schema/Recursive.hs` | plexus-protocol | Add `psRequest :: Maybe Value` to `PluginSchema`; remove `SecurityExtractor` if it existed as draft |
+| `src/plexus/plexus.rs` (schema serialization) | plexus-core | Populate `request` field in `PluginSchema` JSON from `schemars::schema_for!(RequestType)` |
 | `src/Synapse/IR/Types.hs` | synapse | Add `PluginMeta`, `irPluginMeta` to `IR` |
 | `src/Synapse/IR/Builder.hs` | synapse | Populate `irPluginMeta` in `PluginF` branch |
-| `src/Synapse/Algebra/Render.hs` | synapse | `renderRequestContract`, `renderContractEntry`; show contract in hub help output |
-| `app/Main.hs` | synapse | Add `--cookie`/`--header`/`--query` flags; `SYNAPSE_TOKEN` env var; env var scanning for `SYNAPSE_COOKIE_*`/`SYNAPSE_HEADER_*`; intercept -32001 with auth hint |
-| `src/Synapse/Algebra/Navigate.hs` | synapse | `ensureContractSatisfied` proactive warning |
+| `src/Synapse/Algebra/Render.hs` | synapse | `renderRequestSchema`, `renderRequestField`, `renderPluginHelp` with request block |
+| `app/Main.hs` | synapse | Add `--cookie`/`--header`/`--query` flags; env var scanning; -32001 error hint |
+| `src/Synapse/Algebra/Navigate.hs` | synapse | `checkRequestSatisfied` proactive warning |
 
 ## Acceptance Criteria
 
-- [ ] `synapse backend clients` (hub with `require_authenticated`) shows "Authentication required" and "Request requirements: Cookie access_token (required)" in help
-- [ ] `synapse backend clients list` with no token returns "Authentication required. Use --token..."
+- [ ] `synapse backend clients` shows "Authentication required" and "Cookie access_token (required)" in help
+- [ ] `synapse backend clients list` (no token) shows "Authentication required. Use --token..." and exits non-zero
 - [ ] `SYNAPSE_TOKEN=<jwt> synapse backend clients list` authenticates successfully
 - [ ] `synapse --token <jwt> backend clients list` continues to work (existing behavior)
 - [ ] `synapse --cookie access_token=<jwt> backend clients list` authenticates successfully
 - [ ] `SYNAPSE_COOKIE_ACCESS_TOKEN=<jwt> synapse backend clients list` authenticates successfully
-- [ ] `synapse backend forms list` (hub with no security declaration) unaffected
-- [ ] `require_cors` validator does not block synapse (no Origin header = allowed through)
-- [ ] Hub extractor parameters (`#[from_hub]`) do not appear in synapse's method help (stripped by macro)
-- [ ] Wire schema uses `request_contract` array with `ContractEntry` objects — no Rust type strings in schema output
+- [ ] `synapse backend forms list` (no `psRequest`) unaffected — no auth notice shown
+- [ ] Origin (CORS): synapse sends no Origin header, `ValidOrigin` passes, no change needed
+- [ ] `#[from_request]` fields do not appear in synapse's method parameter help (stripped by macro)
+- [ ] Wire schema `request` field is an opaque JSON Schema blob — no Rust type strings, no `SecurityExtractor`, no `ContractEntry`
+- [ ] Old backends without `request` field in `PluginSchema` are handled gracefully (`psRequest = Nothing`)
 
 ## Tests
 
-### Haskell unit tests — `synapse/test/` (HSpec or Tasty)
+### Haskell unit tests — `synapse/test/`
 
-**`renderRequestContract`:**
+**`PluginSchema` JSON roundtrip:**
 ```haskell
-describe "renderRequestContract" $ do
-  it "shows Cookie access_token (required) for auth token entry" $ do
-    let entry = ContractEntry
-          { ceSource = ContractCookie, ceKey = Just "access_token"
-          , ceRequired = True, ceDescription = "JWT auth token" }
-    renderRequestContract [entry] `shouldContain` "Cookie access_token (required)"
-    renderRequestContract [entry] `shouldContain` "JWT auth token"
+describe "PluginSchema JSON roundtrip" $ do
+  it "decodes psRequest when present" $ do
+    let json = [aesonQQ| {
+          "namespace": "clients", "version": "1.0.0", "description": "",
+          "methods": [], "hash": "abc",
+          "request": {
+            "type": "object",
+            "properties": {
+              "auth_token": {
+                "type": "string",
+                "x-plexus-source": { "from": "cookie", "key": "access_token" }
+              }
+            },
+            "required": ["auth_token"]
+          }
+        } |]
+    let schema = fromJust (decode json) :: PluginSchema
+    psRequest schema `shouldSatisfy` isJust
+    let reqSchema = fromJust (psRequest schema)
+    reqSchema ^? key "properties" . key "auth_token" `shouldSatisfy` isJust
 
-  it "returns empty string for empty contract" $
-    renderRequestContract [] `shouldBe` ""
+  it "psRequest is Nothing when field absent" $ do
+    let json = [aesonQQ| {"namespace":"x","version":"1","description":"","methods":[],"hash":"a"} |]
+    let schema = fromJust (decode json) :: PluginSchema
+    psRequest schema `shouldBe` Nothing
 
-  it "shows Server-derived for Derived source" $ do
-    let entry = ContractEntry
-          { ceSource = ContractDerived, ceKey = Nothing
-          , ceRequired = False, ceDescription = "peer address" }
-    renderRequestContract [entry] `shouldContain` "Server-derived"
+  it "roundtrip is lossless" $ do
+    let schema = PluginSchema "ns" "1.0" "desc" [] "hash" (Just (object ["type" .= ("object" :: Text)]))
+    decode (encode schema) `shouldBe` Just schema
 ```
 
-**`renderPluginSecurity`:**
+**`renderRequestSchema`:**
 ```haskell
-describe "renderPluginSecurity" $ do
-  it "includes auth notice when require_authenticated is a validator" $ do
-    let sec = PluginSecurity
-          { psValidators      = [SecurityValidator "require_authenticated" Nothing]
-          , psRequestContract = [ContractEntry ContractCookie (Just "access_token") True "JWT auth token"]
-          }
-    renderPluginSecurity sec `shouldContain` "Authentication required"
-    renderPluginSecurity sec `shouldContain` "--token"
-    renderPluginSecurity sec `shouldContain` "SYNAPSE_TOKEN"
-    renderPluginSecurity sec `shouldContain` "Cookie access_token (required)"
+describe "renderRequestSchema" $ do
+  it "renders Cookie access_token (required)" $ do
+    let reqSchema = object
+          [ "properties" .= object
+              [ "auth_token" .= object
+                  [ "type" .= ("string" :: Text)
+                  , "description" .= ("JWT from Keycloak" :: Text)
+                  , "x-plexus-source" .= object ["from" .= ("cookie" :: Text), "key" .= ("access_token" :: Text)]
+                  ]
+              ]
+          , "required" .= ["auth_token" :: Text]
+          ]
+    let out = renderRequestSchema reqSchema
+    out `shouldContain` "Cookie access_token (required)"
+    out `shouldContain` "JWT from Keycloak"
 
-  it "returns empty string when no validators and empty contract" $ do
-    let sec = PluginSecurity { psValidators = [], psRequestContract = [] }
-    renderPluginSecurity sec `shouldBe` ""
+  it "renders Server-derived for derived fields" $ do
+    let reqSchema = object
+          [ "properties" .= object
+              [ "peer_addr" .= object
+                  [ "x-plexus-source" .= object ["from" .= ("derived" :: Text)]
+                  ]
+              ]
+          , "required" .= ([] :: [Text])
+          ]
+    renderRequestSchema reqSchema `shouldContain` "Server-derived"
 
-  it "does not show auth notice for non-auth validators" $ do
-    let sec = PluginSecurity
-          { psValidators      = [SecurityValidator "require_cors" (Just ["https://app.example.com"])]
-          , psRequestContract = []
-          }
-    renderPluginSecurity sec `shouldNotContain` "Authentication required"
+  it "returns empty for no properties" $ do
+    renderRequestSchema (object []) `shouldBe` ""
 ```
 
-**`resolveToken` — SYNAPSE_TOKEN env var:**
+**`resolveToken` — token resolution priority:**
 ```haskell
 describe "resolveToken" $ do
-  it "returns SYNAPSE_TOKEN when set and no --token flag" $
+  it "SYNAPSE_TOKEN used when no --token flag" $
     withEnv [("SYNAPSE_TOKEN", "env-jwt")] $ do
       result <- resolveToken defaultOpts "mybackend"
       result `shouldBe` Just "env-jwt"
@@ -386,126 +363,97 @@ describe "resolveToken" $ do
       result <- resolveToken (defaultOpts { soToken = Just "flag-jwt" }) "mybackend"
       result `shouldBe` Just "flag-jwt"
 
-  it "falls through to file when SYNAPSE_TOKEN absent" $
+  it "SYNAPSE_COOKIE_ACCESS_TOKEN used when SYNAPSE_TOKEN absent" $
+    withEnv [("SYNAPSE_COOKIE_ACCESS_TOKEN", "cookie-jwt")] $ do
+      result <- resolveToken defaultOpts "mybackend"
+      result `shouldBe` Just "cookie-jwt"
+
+  it "SYNAPSE_TOKEN takes priority over SYNAPSE_COOKIE_ACCESS_TOKEN" $
+    withEnv [("SYNAPSE_TOKEN", "tok"), ("SYNAPSE_COOKIE_ACCESS_TOKEN", "other")] $ do
+      result <- resolveToken defaultOpts "mybackend"
+      result `shouldBe` Just "tok"
+
+  it "falls through to file when env absent" $
     withEnv [] $ do
-      -- No env var, no flag, no file → Nothing
       result <- resolveToken defaultOpts "nonexistent-backend"
       result `shouldBe` Nothing
 ```
 
-**`renderError` — -32001 hint:**
+**`renderRpcError` — -32001 hint:**
 ```haskell
-describe "renderError" $ do
+describe "renderRpcError" $ do
   it "includes --token hint on -32001" $ do
-    let err = RpcError (-32001) "Authentication required: no token" Nothing
-    renderError err `shouldContain` "--token"
-    renderError err `shouldContain` "SYNAPSE_TOKEN"
+    let out = renderRpcError (-32001) "Authentication required: no token"
+    out `shouldContain` "--token"
+    out `shouldContain` "SYNAPSE_TOKEN"
+    out `shouldContain` "Authentication required"
 
   it "renders other errors without token hint" $ do
-    let err = RpcError (-32000) "Execution error" Nothing
-    renderError err `shouldNotContain` "SYNAPSE_TOKEN"
-
-  it "includes original message in -32001 output" $ do
-    let err = RpcError (-32001) "This method requires authentication" Nothing
-    renderError err `shouldContain` "This method requires authentication"
-```
-
-**`PluginSchema` JSON roundtrip — `request_contract` field:**
-```haskell
-describe "PluginSchema JSON" $ do
-  it "decodes psSecurity with request_contract when present" $ do
-    let json = [aesonQQ| {
-          "namespace": "clients", "version": "1.0.0", "description": "...",
-          "methods": [], "hash": "abc",
-          "security": {
-            "validators": [{"name": "require_authenticated"}],
-            "request_contract": [
-              {"source": "Cookie", "key": "access_token", "required": true, "description": "JWT auth token"}
-            ]
-          }
-        } |]
-    let schema = decode json :: Maybe PluginSchema
-    let contract = psRequestContract =<< (psSecurity =<< schema)
-    contract `shouldSatisfy` (not . null)
-    fmap ceSource (listToMaybe =<< contract) `shouldBe` Just ContractCookie
-
-  it "psSecurity is Nothing when field absent" $ do
-    let json = [aesonQQ| {"namespace":"x","version":"1","description":"","methods":[],"hash":"a"} |]
-    let schema = fromJust $ decode json :: PluginSchema
-    psSecurity schema `shouldBe` Nothing
-
-  it "does not decode SecurityExtractor type_name field (removed)" $ do
-    -- Old format with seTypeName should not be accepted
-    let json = [aesonQQ| {
-          "security": {
-            "validators": [],
-            "extractors": [{"name": "peer_addr", "type_name": "Option<SocketAddr>"}]
-          }
-        } |]
-    -- extractors key is unknown; request_contract should be empty
-    -- (exact behavior depends on aeson strictness settings)
-    pure ()  -- presence of old key must not cause a parse error
+    let out = renderRpcError (-32000) "Execution error"
+    out `shouldNotContain` "SYNAPSE_TOKEN"
+    out `shouldContain` "Execution error"
 ```
 
 ### CLI integration tests — `synapse/test/cli-test/` (requires running backend)
 
-These require a backend server with a `clients` hub (REQ-4 `require_authenticated`) and a `forms` hub (no security).
+Backend must have a `clients` hub with `request = ClientsRequest` (REQ-4) and a `forms` hub with no request struct.
 
 ```
--- Auth notice and contract in help:
+-- Auth notice in hub help:
 synapse backend clients
   stdout must contain "Authentication required"
   stdout must contain "Cookie access_token (required)"
-  stdout must contain "--token" or "SYNAPSE_TOKEN"
 
--- Auth notice absent for unsecured hub:
+-- No auth notice for unsecured hub:
 synapse backend forms
   stdout must NOT contain "Authentication required"
   stdout must NOT contain "Request requirements"
 
--- -32001 error message:
+-- -32001 error with hint:
 synapse backend clients list   (no token)
   stderr must contain "Authentication required"
   stderr must contain "--token"
-  exit code must be non-zero
+  exit code non-zero
 
--- SYNAPSE_TOKEN env var:
+-- SYNAPSE_TOKEN:
 SYNAPSE_TOKEN=<valid-jwt> synapse backend clients list
-  exit code == 0
+  exit code 0
   stdout contains client data
 
--- --token flag (existing behavior):
+-- --token flag (existing):
 synapse --token <valid-jwt> backend clients list
-  exit code == 0
+  exit code 0
 
 -- --cookie flag:
 synapse --cookie access_token=<valid-jwt> backend clients list
-  exit code == 0
+  exit code 0
 
--- SYNAPSE_COOKIE_ACCESS_TOKEN env var:
+-- SYNAPSE_COOKIE_ACCESS_TOKEN:
 SYNAPSE_COOKIE_ACCESS_TOKEN=<valid-jwt> synapse backend clients list
-  exit code == 0
+  exit code 0
 
--- CORS: synapse has no Origin header → require_cors passes:
+-- CORS: no Origin header from synapse → ValidOrigin passes:
 synapse --token <valid-jwt> backend clients list
-  exit code == 0   (even if server has require_cors validator)
+  exit code 0   (server has origin: ValidOrigin in request struct)
 
--- Hub extractor params stripped from method help:
+-- Method params stripped: #[from_request] fields absent from help:
 synapse --token <valid-jwt> backend clients list --help
-  stdout must NOT contain "peer_addr"
+  stdout must NOT contain "auth_token" as a parameter name
+  stdout must NOT contain "peer_addr" as a parameter name
   stdout must NOT contain "origin" as a parameter name
+  (these are request struct fields, not RPC params)
 ```
 
 ## Open Design Questions
 
-**Q1: Should `ContractEntry` include JSON Schema type information for the expected value?**
+**Q1: Should synapse validate the value format of request fields (e.g. check auth_token looks like a JWT)?**
 
-No for v1. `ContractEntry` is about transport-level routing (where to put data), not type validation. JSON Schema type info would be needed for code generation tools (OpenAPI generators, typed client SDKs) that need to know the shape of the value. Synapse only needs to know where to put it. Add type info later if a code gen use case materializes.
+No for v1. The JSON Schema `format` field can express this but synapse doesn't need to validate — the server will reject bad values with a meaningful error. Proactive format validation can be added if it proves useful.
 
-**Q2: Should `require_authenticated` generate a `ContractEntry`?**
+**Q2: What if `psRequest` is present but `x-plexus-source` is absent on some fields?**
 
-Yes — since `require_authenticated` checks `ctx.auth`, and auth comes from the `access_token` cookie (via `CombinedAuthMiddleware`), the macro should infer `ContractEntry { source: Cookie, key: "access_token", required: true }` for hubs with this validator in their `validate` list. This is the one case where a validator drives a contract entry, because the cookie is the specific transport mechanism auth depends on. Synapse's existing `--token` flag already sends this cookie; the contract entry makes the requirement explicit in help output and the proactive check.
+Treat as `derived` — synapse cannot help populate them, but shows them in docs as "Unknown (optional): field_name". The server may compute them server-side or they may be internal fields (`#[from_auth_context]`). Either way, synapse can't supply them.
 
-**Q3: What about user-defined extractor functions not in the stdlib?**
+**Q3: Should `SYNAPSE_TOKEN` be deprecated in favor of `SYNAPSE_COOKIE_ACCESS_TOKEN`?**
 
-Default to `ContractDerived`. The macro cannot infer transport semantics for arbitrary user functions. The contract entry will appear in the schema as `{ source: "Derived", key: null, required: false }` with a description like `"server-derived: my_extractor_fn"`. Synapse can show this in help so the user knows something is happening server-side, but cannot help supply the value. If the user wants synapse to supply data for a custom extractor, they should implement it as a cookie/header extractor (which the macro recognizes) rather than a completely opaque function.
+No. Keep both. `SYNAPSE_TOKEN` is a better UX shortcut for the common case. `SYNAPSE_COOKIE_ACCESS_TOKEN` is the general form that makes the transport mechanism explicit. Both map to the same `access_token` cookie on WS upgrade.

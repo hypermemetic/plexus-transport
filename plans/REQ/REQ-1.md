@@ -1,332 +1,324 @@
-# REQ-1: Request Context — Forward HTTP Request to Method Dispatch
+# REQ-1: `PlexusRequest` Derive — Typed HTTP Upgrade Request as First-Class Input
 
 **epic:** REQ
-**unlocks:** [REQ-2, REQ-3]
+**unlocks:** [REQ-2, REQ-3, REQ-4]
 
 ## Status: Planned
 
 ## Goal
 
-Make the full HTTP upgrade request available through the Plexus dispatch chain, enabling per-method extraction of arbitrary request data — cookies, Origin, custom headers, URI — via composable transformer functions.
+Make the full HTTP upgrade request available as a typed, derive-generated struct. The struct definition IS the request contract — field annotations declare where data comes from, field optionality declares whether missing data is fatal, and `#[derive(schemars::JsonSchema)]` emits the wire schema with `x-plexus-source` extensions. No separate `ContractEntry` type needed.
+
+The core insight: the HTTP upgrade request is a deserializable input, parallel to JSON-RPC params. You define a typed struct for it. A derive macro generates the extraction logic from field-level source annotations.
 
 ## Problem
 
-Today the transport middleware does one thing: extract a JWT token → produce an `AuthContext` → insert into Extensions. Everything else in the HTTP upgrade request (cookies, Origin, all other headers, URI) is discarded before the method handler runs.
+Today the transport middleware does one thing: extract a JWT token → produce an `AuthContext` → insert into Extensions. Everything else in the HTTP upgrade request (cookies, Origin, all other headers, URI) is discarded before the method handler runs. The REQ-1 design in an earlier draft addressed this with standalone extractor functions and a bespoke `ContractEntry` wire format. Both are unnecessary:
 
-This means:
-- Origin validation must be hardcoded in the middleware (not per-method configurable)
-- Cookie extraction is only for auth tokens; other cookie values are inaccessible
-- There is no way to write a method that inspects the `Referer`, `User-Agent`, or any custom header
-- The `#[from_auth]` macro is auth-specific when it could be a general extraction mechanism
-
-The goal is to unify these into a single composable pattern:
-
-```rust
-// Any typed value extractable from the HTTP request
-#[from_request(extract_origin)]    origin: Option<String>,
-#[from_request(extract_cookie("session_id"))] session: Option<String>,
-#[from_request(self.db.validate_user)]        user: ValidUser,
-```
+- Standalone extractors (`extract_origin`, `extract_cookie`, etc.) are replaced by field annotations on the request struct
+- `ContractEntry`/`ContractSource` are replaced by the struct's derived JSON Schema with `x-plexus-source` extensions
+- The schema IS the contract — no parallel type needed
 
 ## Architecture
 
-### Layer 1 — `RequestContext` type (plexus-transport)
+### Layer 1 — `RawRequestContext` (plexus-transport, internal)
 
-A struct capturing the parts of the HTTP upgrade request that are useful post-handshake:
+Internal struct capturing the parts of the HTTP upgrade request useful post-handshake. Not user-visible; it's the input to `PlexusRequest::extract`.
 
 ```rust
-pub struct RequestContext {
+// src/request/raw.rs — internal, not re-exported
+pub struct RawRequestContext {
     pub headers: http::HeaderMap,
     pub uri:     http::Uri,
-    pub auth:    Option<AuthContext>,  // populated by existing SessionValidator
+    pub auth:    Option<AuthContext>,   // populated by CombinedAuthMiddleware
     pub peer:    Option<std::net::SocketAddr>,
 }
 ```
 
-The existing `CombinedAuthMiddleware` inserts `Arc<AuthContext>` into Extensions. Extend it to also insert `Arc<RequestContext>` containing the full header map, URI, and resolved auth together.
+The existing `CombinedAuthMiddleware` inserts `Arc<AuthContext>` into Extensions. Extend it to also insert `Arc<RawRequestContext>` containing the full header map, URI, and resolved auth. `arc_into_rpc_module` extracts `Arc<RawRequestContext>` instead of bare `Arc<AuthContext>`.
 
-### Layer 2 — `RequestContext` in Extensions (plexus-core)
+### Layer 2 — `PlexusRequest` derive macro (plexus-transport + plexus-macros)
 
-`arc_into_rpc_module` currently extracts `Arc<AuthContext>` from Extensions. Change it to extract `Arc<RequestContext>` instead. `AuthContext` is still available as `ctx.auth`. This is a non-breaking change for `#[from_auth]` callers — they continue to receive `AuthContext` via `ctx.auth`.
+A user-defined struct with `#[derive(PlexusRequest, schemars::JsonSchema)]` gets:
 
-### Layer 3 — Extractor functions
+1. `fn extract(ctx: &RawRequestContext) -> Result<Self, PlexusError>` — generated extraction logic
+2. `x-plexus-source` schemars attributes on each field — drives JSON Schema output
 
-An extractor is any function (or closure) with this signature:
+**Field annotations:**
 
-```rust
-Fn(&RequestContext) -> Result<T, PlexusError>
-// or
-Fn(&RequestContext) -> T  (for infallible extractors)
-// or
-Fn(&RequestContext) -> Option<T>  (for optional extractors)
-```
+| Annotation | Source | Extraction behavior |
+|------------|--------|---------------------|
+| `#[from_cookie("name")]` | Cookie header | Parse `name=value` from Cookie string |
+| `#[from_header("name")]` | HTTP header | Read named header, UTF-8 decode |
+| `#[from_query("name")]` | WS upgrade URI | Read named query param |
+| `#[from_peer]` | Network state | Copy `RawRequestContext::peer` |
+| `#[from_auth_context]` | CombinedAuthMiddleware | Copy `RawRequestContext::auth` — for internal use |
+| *(none)* | n/a | Field must implement `Default`; always succeeds |
 
-Standard extractors shipped with plexus-transport:
+**Optionality rules:**
 
-```rust
-// Origin header → validated String
-pub fn extract_origin(ctx: &RequestContext) -> Option<String>;
+- `field: String` (non-optional) — extraction failure returns `Err(PlexusError::Unauthenticated(...))`. Call does not proceed.
+- `field: Option<T>` — extraction failure or missing data returns `Ok(None)`. Call continues.
 
-// Named cookie value
-pub fn extract_cookie<'a>(name: &'a str) 
-    -> impl Fn(&RequestContext) -> Option<String> + 'a;
+This collapses the "validator" concept entirely. `require_authenticated` becomes `auth_token: String` on the request struct. If the cookie is absent, extraction fails and the call is rejected — no separate validator needed.
 
-// Peer IP address  
-pub fn extract_peer_addr(ctx: &RequestContext) -> Option<std::net::SocketAddr>;
-
-// Full URI
-pub fn extract_uri(ctx: &RequestContext) -> http::Uri;
-
-// Raw header value
-pub fn extract_header(name: &'static str) 
-    -> impl Fn(&RequestContext) -> Option<String>;
-```
-
-### Layer 3b — Request Contract
-
-Each stdlib extractor maps to a `ContractEntry` — a client-facing declaration of what HTTP-level data the extractor needs to function. This is separate from the Rust type the extractor produces. The contract is purely for clients to know what to send on WS upgrade; the server still processes the raw request internally.
-
-**Key types:**
+**Example:**
 
 ```rust
-// Where the data lives in the HTTP request (client's perspective)
-pub enum ContractSource {
-    Cookie,      // client sends Cookie: name=value on WS upgrade
-    Header,      // client sends an HTTP header on WS upgrade
-    QueryParam,  // client appends ?key=value to the WS upgrade URI
-    Derived,     // computed server-side (peer_addr, etc.) — client cannot supply this
-}
+// src/auth/clients_request.rs (FormVeritas crate)
+#[derive(PlexusRequest, schemars::JsonSchema)]
+struct ClientsRequest {
+    /// JWT from Keycloak auth flow
+    #[from_cookie("access_token")]
+    auth_token: String,              // required: extraction failure = call fails
 
-// One entry per extractor that requires client-supplied data
-pub struct ContractEntry {
-    pub source:      ContractSource,
-    pub key:         Option<String>,  // header/cookie/param name; None for Derived
-    pub required:    bool,
-    pub description: String,
+    /// Caller's IP address (server-derived)
+    #[from_peer]
+    peer_addr: Option<SocketAddr>,   // optional: missing is fine
+
+    /// Request origin header
+    #[from_header("origin")]
+    origin: Option<String>,          // optional
 }
 ```
 
-**Mapping of stdlib extractors to ContractEntry:**
+**Custom extractor fallback:** For exotic cases where an annotation isn't enough, use `#[from_request(my_fn)]` where `my_fn: fn(&RawRequestContext) -> Result<T, PlexusError>`. The macro calls `my_fn(ctx)?` and skips schema source annotation (treated as `x-plexus-source: derived`).
 
-| Extractor | ContractSource | key | required | Notes |
-|-----------|----------------|-----|----------|-------|
-| `extract_origin` | `Header` | `"origin"` | false | Browser sends automatically |
-| `extract_cookie("name")` | `Cookie` | `name` | false | Client must include in Cookie header |
-| `extract_header("name")` | `Header` | `name` | false | Client must include the header |
-| `extract_peer_addr` | `Derived` | None | false | TCP network state — client cannot control |
-| `extract_uri` | `Derived` | None | false | WS upgrade URI — always present |
-| `require_allowed_origin(...)` | — | — | — | Validator, not an extractor. No ContractEntry needed. |
+### Layer 3 — `#[from_request]` on method params (plexus-macros)
 
-**Validators do not produce ContractEntries.** They are pure gates that accept or reject a request — they don't declare anything the client needs to provide. A validator like `require_allowed_origin` checks the `origin` header but does not require the client to do anything beyond what a browser does automatically.
+After the hub extracts its `RequestStruct`, individual method params annotated with `#[from_request]` pull named fields from that struct:
 
-**Unknown extractor functions** (user-defined, not in the stdlib registry) default to `ContractEntry { source: Derived, key: None, required: false }`. The macro cannot infer their transport semantics.
-
-The contract lives in the wire schema (see REQ-4, REQ-5) so that clients like the synapse CLI can:
-- Show "Request requirements" in `--help` output
-- Proactively warn when required entries have no corresponding value configured
-- Accept generic `--cookie`/`--header`/`--query` flags to satisfy arbitrary contracts
-
-### Layer 4 — Macro generalization (plexus-macros)
-
-Generalize `#[from_auth(expr)]` to `#[from_request(expr)]` where `expr` receives a `&RequestContext` instead of `&AuthContext`.
-
-`#[from_auth(expr)]` becomes sugar for `#[from_request(|ctx| expr(ctx.auth.as_ref().ok_or(Unauthenticated)?)))]` — i.e. it extracts the auth field and panics semantically if absent.
-
-The macro codegen:
 ```rust
-// Before (from_auth):
-let auth_ctx = auth.ok_or_else(|| Unauthenticated("..."))?;
-let user = self.db.validate_user(&auth_ctx).await?;
-
-// After (from_request — same behavior, different source):
-let req_ctx = request_context.ok_or_else(|| Unauthenticated("no request context"))?;
-let user = self.db.validate_user(req_ctx.auth.as_ref().ok_or_else(|| Unauthenticated("..."))?).await?;
+async fn list(
+    &self,
+    #[from_request] auth_token: String,    // pulls ClientsRequest::auth_token
+    search: Option<String>,                // normal RPC param
+) -> impl Stream<Item = ClientEvent> { ... }
 ```
 
-### Layer 5 — Origin validation via extractor (AUTH-18 implementation path)
+The param name must match a field name in the hub's request struct. Type must match. Mismatch = compile error.
 
-With REQ in place, Origin validation is not a middleware concern — it becomes a method-level extractor:
+No expr argument — the extraction is defined on the struct, not on the method param. `#[from_request]` is a field accessor, not an extractor.
+
+### Layer 4 — `#[from_auth(expr)]` unchanged (plexus-macros)
+
+Reads `auth: Option<AuthContext>` from the extracted request struct (the `#[from_auth_context]` field), passes it to the resolver expression. `ValidUser` is never in the schema.
 
 ```rust
-pub fn require_origin(allowed: &[&str]) -> impl Fn(&RequestContext) -> Result<(), PlexusError> {
-    let allowed = allowed.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    move |ctx| {
-        let origin = extract_origin(ctx);
-        match origin {
-            None => Ok(()),  // non-browser client, allow
-            Some(o) if allowed.contains(&o) => Ok(()),
-            Some(o) => Err(PlexusError::Unauthenticated(format!("Origin not allowed: {}", o))),
-        }
-    }
+async fn list(
+    &self,
+    #[from_request] auth_token: String,
+    #[from_auth(self.db.validate_user)] user: ValidUser,  // unchanged
+    search: Option<String>,
+) -> ...
+```
+
+### JSON Schema output with `x-plexus-source`
+
+The struct's `schemars::JsonSchema` impl (generated by derive) annotates each field with `x-plexus-source`:
+
+```json
+{
+  "request": {
+    "type": "object",
+    "properties": {
+      "auth_token": {
+        "type": "string",
+        "description": "JWT from Keycloak auth flow",
+        "x-plexus-source": { "from": "cookie", "key": "access_token" }
+      },
+      "peer_addr": {
+        "type": "string",
+        "description": "Caller IP address",
+        "x-plexus-source": { "from": "derived" }
+      },
+      "origin": {
+        "type": "string",
+        "x-plexus-source": { "from": "header", "key": "origin" }
+      }
+    },
+    "required": ["auth_token"]
+  }
 }
-
-// Usage:
-#[from_request(require_origin(&["https://app.formveritas.com"]))]
-_origin_check: (),
 ```
 
-## Tickets
+`required` array = non-Option fields. `x-plexus-source` is synthesized by the derive macro via schemars `schema_with` or custom attributes. The wire schema for `psRequest` in `PluginSchema` (REQ-5) is this JSON Schema blob, passed as an opaque `Value`.
 
-```
-REQ-1  (this)   RequestContext type, Extensions wiring, extractor stdlib, ContractEntry types
-REQ-2           Macro: generalize #[from_auth] → #[from_request]
-REQ-3           AUTH-18 implementation using REQ extractors (Origin validation)
-```
-
-## Dependency DAG
-
-```
-REQ-1
-  ├── REQ-2 (macro generalization)
-  │     └── REQ-3 (origin validation via extractor)
-  └── (any future extractor built on RequestContext)
-```
-
-## Files to Modify
+## Files to Add/Modify
 
 | File | Repo | Change |
 |------|------|--------|
-| `src/websocket.rs` | plexus-transport | Insert `Arc<RequestContext>` into Extensions alongside `Arc<AuthContext>` |
-| `src/lib.rs` | plexus-transport | Export `RequestContext`, standard extractors, `ContractEntry`, `ContractSource` |
-| `src/extractors/contract.rs` | plexus-transport | `ContractEntry`, `ContractSource`, stdlib extractor → ContractEntry mapping |
-| `src/plexus/plexus.rs` | plexus-core | Extract `Arc<RequestContext>` instead of bare `Arc<AuthContext>` |
-| `src/parse.rs` | plexus-macros | Add `from_request` as synonym for `from_auth` with `RequestContext` input |
-| `src/codegen/activation.rs` | plexus-macros | Generate `req_ctx` extraction, pass to resolver exprs; infer ContractEntry per extractor |
+| `src/request/mod.rs` | plexus-transport | New module: re-exports `PlexusRequest` trait, `RawRequestContext`, `PlexusRequestField` |
+| `src/request/raw.rs` | plexus-transport | `RawRequestContext` struct (internal) |
+| `src/request/derive.rs` | plexus-transport | `PlexusRequest` trait definition; `PlexusRequestField` trait for newtype field types |
+| `src/lib.rs` | plexus-transport | `pub mod request;` export |
+| `src/websocket.rs` | plexus-transport | Insert `Arc<RawRequestContext>` into Extensions alongside auth |
+| `plexus-macros/src/request.rs` | plexus-macros | `#[derive(PlexusRequest)]` proc-macro: parse field annotations, generate `extract()`, generate schemars `x-plexus-source` attributes |
+| `plexus-macros/src/lib.rs` | plexus-macros | Export `PlexusRequest` derive |
+| `src/plexus/plexus.rs` | plexus-core | Extract `Arc<RawRequestContext>` instead of bare `Arc<AuthContext>`; pass to dispatch |
+
+Note: standalone extractor functions (`extract_origin`, `extract_cookie`, etc.), `ContractEntry`, and `ContractSource` are **not added** — they are replaced by the derive approach.
 
 ## Acceptance Criteria
 
-- [ ] `RequestContext` is available in Extensions after any authenticated or unauthenticated WS connection
-- [ ] `extract_origin`, `extract_cookie`, `extract_peer_addr` work in unit tests against a fake `RequestContext`
+- [ ] `#[derive(PlexusRequest)]` on a struct with `#[from_cookie("access_token")] auth_token: String` generates a working `extract()` that returns `Err` when the cookie is absent
+- [ ] Same struct with `origin: Option<String>` annotated `#[from_header("origin")]` returns `Ok(None)` when Origin header is absent
+- [ ] `#[from_peer] peer_addr: Option<SocketAddr>` extracts peer address correctly
+- [ ] `schemars::schema_for!(ClientsRequest)` output includes `x-plexus-source` on annotated fields
+- [ ] `required` array in schema output matches non-Option fields only
 - [ ] `#[from_auth(expr)]` continues to work unchanged (backward compatible)
-- [ ] `#[from_request(extract_origin)]` compiles and returns `Option<String>` at method call time
-- [ ] No HTTP headers are cloned unnecessarily for connections that don't use `#[from_request]`
-- [ ] `ContractEntry` metadata is attached to each extractor function in the stdlib
-- [ ] `extract_peer_addr` has `ContractSource::Derived`; `extract_cookie("access_token")` has `ContractSource::Cookie` with `key = Some("access_token")`
+- [ ] `RawRequestContext` is available in Extensions after any WS connection (authenticated or not)
+- [ ] No headers are cloned for connections that don't use a `PlexusRequest` hub
 
 ## Tests
 
-### Unit — extractor stdlib (`plexus-transport/tests/extractors.rs`)
+### Unit — derive-based extraction (`plexus-transport/tests/request_extract.rs`)
 
-Each extractor must be testable with a hand-constructed `RequestContext` — no HTTP server, no WebSocket.
+Tests construct a `RawRequestContext` directly — no HTTP server, no WebSocket.
 
 ```rust
-fn make_ctx(headers: &[(&str, &str)]) -> RequestContext {
+fn make_raw(headers: &[(&str, &str)], peer: Option<&str>) -> RawRequestContext {
     let mut h = http::HeaderMap::new();
     for (k, v) in headers {
         h.insert(http::header::HeaderName::from_static(k), v.parse().unwrap());
     }
-    RequestContext { headers: h, uri: "/".parse().unwrap(), auth: None, peer: None }
+    RawRequestContext {
+        headers: h,
+        uri: "/".parse().unwrap(),
+        auth: None,
+        peer: peer.map(|p| p.parse().unwrap()),
+    }
 }
 
-// extract_origin
-#[test] fn extract_origin_present() {
-    let ctx = make_ctx(&[("origin", "https://app.example.com")]);
-    assert_eq!(extract_origin(&ctx), Some("https://app.example.com".into()));
-}
-#[test] fn extract_origin_absent() {
-    let ctx = make_ctx(&[]);
-    assert_eq!(extract_origin(&ctx), None);
-}
-
-// extract_cookie
-#[test] fn extract_cookie_present() {
-    let ctx = make_ctx(&[("cookie", "session=abc; token=xyz")]);
-    assert_eq!(extract_cookie("session")(&ctx), Some("abc".into()));
-    assert_eq!(extract_cookie("token")(&ctx),   Some("xyz".into()));
-}
-#[test] fn extract_cookie_absent() {
-    let ctx = make_ctx(&[("cookie", "other=val")]);
-    assert_eq!(extract_cookie("session")(&ctx), None);
-}
-#[test] fn extract_cookie_no_cookie_header() {
-    let ctx = make_ctx(&[]);
-    assert_eq!(extract_cookie("session")(&ctx), None);
+#[derive(PlexusRequest)]
+struct TestRequest {
+    #[from_cookie("access_token")]
+    auth_token: String,
+    #[from_header("origin")]
+    origin: Option<String>,
+    #[from_peer]
+    peer_addr: Option<SocketAddr>,
 }
 
-// extract_peer_addr
-#[test] fn extract_peer_addr_present() {
-    let ctx = RequestContext { peer: Some("1.2.3.4:5678".parse().unwrap()), ..make_ctx(&[]) };
-    assert_eq!(extract_peer_addr(&ctx), Some("1.2.3.4:5678".parse().unwrap()));
-}
-#[test] fn extract_peer_addr_absent() {
-    assert_eq!(extract_peer_addr(&make_ctx(&[])), None);
+#[test] fn required_cookie_present() {
+    let ctx = make_raw(&[("cookie", "access_token=jwt123")], None);
+    let req = TestRequest::extract(&ctx).unwrap();
+    assert_eq!(req.auth_token, "jwt123");
 }
 
-// extract_header (generic)
-#[test] fn extract_header_present() {
-    let ctx = make_ctx(&[("x-request-id", "req-123")]);
-    assert_eq!(extract_header("x-request-id")(&ctx), Some("req-123".into()));
+#[test] fn required_cookie_absent_is_err() {
+    let ctx = make_raw(&[], None);
+    assert!(TestRequest::extract(&ctx).is_err());
 }
-#[test] fn extract_header_absent() {
-    assert_eq!(extract_header("x-request-id")(&make_ctx(&[])), None);
+
+#[test] fn optional_header_present() {
+    let ctx = make_raw(&[("cookie", "access_token=x"), ("origin", "https://app.example.com")], None);
+    let req = TestRequest::extract(&ctx).unwrap();
+    assert_eq!(req.origin, Some("https://app.example.com".into()));
+}
+
+#[test] fn optional_header_absent() {
+    let ctx = make_raw(&[("cookie", "access_token=x")], None);
+    let req = TestRequest::extract(&ctx).unwrap();
+    assert_eq!(req.origin, None);
+}
+
+#[test] fn peer_addr_present() {
+    let ctx = make_raw(&[("cookie", "access_token=x")], Some("1.2.3.4:5678"));
+    let req = TestRequest::extract(&ctx).unwrap();
+    assert_eq!(req.peer_addr, Some("1.2.3.4:5678".parse().unwrap()));
+}
+
+#[test] fn peer_addr_absent() {
+    let ctx = make_raw(&[("cookie", "access_token=x")], None);
+    let req = TestRequest::extract(&ctx).unwrap();
+    assert_eq!(req.peer_addr, None);
+}
+
+#[test] fn cookie_header_with_multiple_values() {
+    let ctx = make_raw(&[("cookie", "session=abc; access_token=tok; other=xyz")], None);
+    let req = TestRequest::extract(&ctx).unwrap();
+    assert_eq!(req.auth_token, "tok");
 }
 ```
 
-### Unit — ContractEntry metadata (`plexus-transport/tests/contract.rs`)
+### Unit — JSON Schema output (`plexus-transport/tests/request_schema.rs`)
 
 ```rust
-#[test] fn extract_peer_addr_contract() {
-    let entry = extract_peer_addr_contract();
-    assert_eq!(entry.source, ContractSource::Derived);
-    assert!(entry.key.is_none());
-    assert!(!entry.required);
+#[test] fn schema_has_x_plexus_source_on_cookie_field() {
+    let schema = schemars::schema_for!(TestRequest);
+    let obj = serde_json::to_value(&schema).unwrap();
+    let source = &obj["properties"]["auth_token"]["x-plexus-source"];
+    assert_eq!(source["from"], "cookie");
+    assert_eq!(source["key"], "access_token");
 }
 
-#[test] fn extract_cookie_contract() {
-    let entry = extract_cookie_contract("access_token");
-    assert_eq!(entry.source, ContractSource::Cookie);
-    assert_eq!(entry.key.as_deref(), Some("access_token"));
-    assert!(!entry.required);
+#[test] fn schema_has_derived_source_on_peer_field() {
+    let schema = schemars::schema_for!(TestRequest);
+    let obj = serde_json::to_value(&schema).unwrap();
+    let source = &obj["properties"]["peer_addr"]["x-plexus-source"];
+    assert_eq!(source["from"], "derived");
 }
 
-#[test] fn extract_origin_contract() {
-    let entry = extract_origin_contract();
-    assert_eq!(entry.source, ContractSource::Header);
-    assert_eq!(entry.key.as_deref(), Some("origin"));
-    assert!(!entry.required);
+#[test] fn schema_required_matches_non_option_fields() {
+    let schema = schemars::schema_for!(TestRequest);
+    let obj = serde_json::to_value(&schema).unwrap();
+    let required = obj["required"].as_array().unwrap();
+    let names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+    assert!(names.contains(&"auth_token"));
+    assert!(!names.contains(&"origin"));
+    assert!(!names.contains(&"peer_addr"));
 }
 ```
 
 ### Unit — auth field forwarding
 
 ```rust
-#[test] fn request_context_carries_auth() {
-    let auth = AuthContext { user_id: "u1".into(), session_id: "s1".into(),
-                             roles: vec![], metadata: Default::default() };
-    let ctx = RequestContext { auth: Some(auth.clone()), ..make_ctx(&[]) };
-    assert_eq!(ctx.auth.as_ref().unwrap().user_id, "u1");
+#[derive(PlexusRequest)]
+struct AuthedRequest {
+    #[from_cookie("access_token")]
+    auth_token: String,
+    #[from_auth_context]
+    auth: Option<AuthContext>,
 }
 
-#[test] fn request_context_no_auth_is_none() {
-    let ctx = make_ctx(&[]);
-    assert!(ctx.auth.is_none());
+#[test] fn auth_context_carried_through() {
+    let mut ctx = make_raw(&[("cookie", "access_token=x")], None);
+    ctx.auth = Some(AuthContext { user_id: "u1".into(), session_id: "s1".into(),
+                                  roles: vec![], metadata: Default::default() });
+    let req = AuthedRequest::extract(&ctx).unwrap();
+    assert_eq!(req.auth.as_ref().unwrap().user_id, "u1");
+}
+
+#[test] fn auth_context_none_when_unauthenticated() {
+    let ctx = make_raw(&[("cookie", "access_token=x")], None);
+    let req = AuthedRequest::extract(&ctx).unwrap();
+    assert!(req.auth.is_none());
 }
 ```
 
 ### Integration — Extensions wiring (`plexus-transport/tests/integration.rs`)
 
-Requires a running test server using `TestSessionValidator`.
+Start a test server with `TestSessionValidator`. Connect a client. Call a method that uses `#[from_request]`.
 
-```rust
-// Start a server, connect a client, call a method that reads from RequestContext.
-// Verify the method receives the correct header values.
-//
-// Test method: echo_origin(#[from_request(extract_origin)] origin: Option<String>) -> origin
-//
-// Case 1: client connects with Origin header set → method returns Some("http://test.local")
-// Case 2: client connects without Origin header → method returns None
-// Case 3: authenticated client → ctx.auth is Some; unauthenticated → ctx.auth is None
+```
+// echo_origin method uses #[from_request] origin: Option<String>
+// Case 1: WS upgrade with Origin header → method returns Some("http://test.local")
+// Case 2: WS upgrade without Origin header → method returns None
+// Case 3: authenticated client → req struct has populated auth field
+// Case 4: unauthenticated client + hub with required auth_token field → call returns -32001
 ```
 
 ## Open Design Questions
 
-**Q1: Should `ContractEntry` include JSON Schema type information for the expected value?**
+**Q1: Should `#[from_peer]` fields appear in the JSON Schema?**
 
-No — not in v1. `ContractEntry` is about transport-level routing (where to put data), not type validation. Rust type names like `Option<SocketAddr>` are meaningless to Haskell clients. If code generation tools (OpenAPI, client SDKs) need type info later, add it then. For now, the client only needs to know *where* to send the data, not what shape to validate it.
+Yes. Include them with `x-plexus-source: { "from": "derived" }` so docs show they exist and clients know a peer address is visible server-side. They don't appear in `required`.
 
-**Q2: Should synapse use a generic passthrough mode (like websocat with raw flags) or schema-driven flag generation?**
+**Q2: Can a request struct field have a custom extractor function?**
 
-Schema-driven, with a fallback to generic flags. Schema-driven is better because:
-- `--help` can explain exactly what's required ("Cookie access_token (required): JWT auth token")
-- Required entries can be proactively checked before connecting
-- The generic `--cookie key=value`, `--header key=value`, `--query key=value` flags handle unknown or user-defined extractors that produce `ContractDerived` or have no schema entry
+Yes: `#[from_request(my_fn)]` where `my_fn: fn(&RawRequestContext) -> Result<T, PlexusError>`. The macro generates `my_fn(ctx)?` and annotates the field with `x-plexus-source: { "from": "derived" }` (opaque to the schema). This is the escape hatch for exotic extraction not covered by the stdlib annotations.
+
+**Q3: Should `PlexusRequest` be a trait or a generated inherent impl?**
+
+Trait. Defining `trait PlexusRequest: schemars::JsonSchema` allows hub dispatch code to be generic over `R: PlexusRequest`, enables mocking in tests, and allows per-method override (`#[hub_method(request = ())]` uses `NoRequest: PlexusRequest`).

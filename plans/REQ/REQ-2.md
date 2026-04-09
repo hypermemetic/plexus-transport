@@ -1,153 +1,199 @@
-# REQ-2: Macro — Generalize `#[from_auth]` to `#[from_request]`
+# REQ-2: Macro — `#[from_request]` Field Injection and `#[from_auth]` Compatibility
 
 **blocked_by:** [REQ-1]
-**unlocks:** [REQ-3]
+**unlocks:** [REQ-3, REQ-4]
 
 ## Status: Planned
 
 ## Goal
 
-Generalize the `#[from_auth(expr)]` macro attribute into `#[from_request(expr)]` where the resolver expression receives a `&RequestContext` instead of `&AuthContext`. Keep `#[from_auth]` working as sugar over `#[from_request]`.
+Wire the `PlexusRequest` derive (REQ-1) into the macro dispatch layer. `#[from_request]` on a method param means "inject this named field from the hub's already-extracted request struct." No resolver expression — the extraction is defined on the struct. Keep `#[from_auth(expr)]` working exactly as today.
 
-## Current Codegen (`#[from_auth]`)
+## How It Differs From the Old Approach
+
+The original design had `#[from_request(expr)]` where the expression was an extractor function receiving `&RequestContext`. That design is gone. The new design is:
+
+- Extraction logic lives on the **request struct** (field annotations: `#[from_cookie]`, `#[from_header]`, etc.)
+- `#[from_request]` on a method param is just a **field accessor** — it pulls a named field from the already-extracted struct
+- No expr argument on `#[from_request]`
+- `#[from_auth(expr)]` stays exactly as today — reads the `auth` field from the extracted struct, runs the resolver
+
+The macro doesn't need to understand extractors at all. By the time `#[from_request]` runs, the struct is already extracted hub-side.
+
+## `#[from_request]` Semantics
 
 ```rust
-// Input:
-async fn list(&self, #[from_auth(self.db.validate_user)] user: ValidUser, ...) -> ...
-
-// Generated (simplified):
-let auth_ctx = auth.ok_or_else(|| PlexusError::Unauthenticated("..."))?;
-let user = self.db.validate_user(&auth_ctx).await
-    .map_err(|e| PlexusError::ExecutionError(e.to_string()))?;
+#[hub_methods(namespace = "clients", request = ClientsRequest)]
+impl ClientsActivation {
+    async fn list(
+        &self,
+        #[from_request] auth_token: String,    // pulls ClientsRequest::auth_token
+        #[from_request] peer_addr: Option<SocketAddr>,  // pulls ClientsRequest::peer_addr
+        search: Option<String>,                // normal RPC param
+    ) -> impl Stream<Item = ClientEvent> { ... }
+}
 ```
 
-The resolver expression receives `&AuthContext`.
+Rules:
+- The param name must match a field name in the hub's declared request struct type
+- The param type must match the field type in the request struct
+- Name not found in struct → compile error with message naming the missing field
+- Type mismatch → compile error
+- `#[from_request]` params are stripped from the RPC method schema (invisible to clients, same as `#[from_auth]`)
 
-## Target Codegen (`#[from_request]`)
-
-```rust
-// Input:
-async fn list(&self, #[from_request(extract_origin)] origin: Option<String>, ...) -> ...
-
-// Generated:
-let req_ctx = request_context  // Arc<RequestContext> from Extensions
-    .as_deref()
-    .ok_or_else(|| PlexusError::Unauthenticated("No request context"))?;
-let origin = extract_origin(req_ctx);
-```
-
-The resolver expression receives `&RequestContext`.
-
-## `#[from_auth]` as Sugar
+## `#[from_auth(expr)]` Semantics (Unchanged)
 
 ```rust
-// Input:
 #[from_auth(self.db.validate_user)] user: ValidUser
-
-// Desugars to:
-#[from_request(|ctx| {
-    let auth = ctx.auth.as_ref()
-        .ok_or_else(|| PlexusError::Unauthenticated("Authentication required"))?;
-    self.db.validate_user(auth)
-})] user: ValidUser
 ```
 
-Implementable by detecting `from_auth` in `parse.rs` and converting it to an `AuthResolver` with a wrapper closure during codegen. No change to the user-facing `#[from_auth]` syntax — it remains identical.
+Codegen reads `req_struct.auth` (the `#[from_auth_context]` field on the request struct), passes it to `expr`, awaits if async. Unchanged from today except the source is `req_struct.auth` instead of a bare `Arc<AuthContext>` from Extensions.
 
-## Parse Changes (`src/parse.rs`)
+`from_auth` does NOT need to change to a `from_request` field accessor. It's a different concept: it runs an async resolver expression and produces a domain type. `from_request` just does a field copy.
 
-Add `from_request` to `extract_from_auth_attr()`:
+## Parse Changes (`plexus-macros/src/parse.rs`)
 
 ```rust
-pub enum ResolverKind {
-    FromAuth(Expr),     // existing — resolver receives &AuthContext
-    FromRequest(Expr),  // new — resolver receives &RequestContext
-}
-
-pub struct AuthResolver {
-    pub param_name: Ident,
-    pub kind: ResolverKind,
+pub enum MethodParam {
+    Normal(syn::FnArg),
+    FromRequest { field_name: Ident, ty: Type },   // #[from_request]
+    FromAuth { param_name: Ident, ty: Type, resolver: Expr },  // #[from_auth(expr)]
 }
 ```
 
-## Codegen Changes (`src/codegen/activation.rs`)
+- `#[from_request]` attribute — no arguments. Parse the param name and type. Record as `FromRequest`.
+- `#[from_auth(expr)]` attribute — parse expr argument. Unchanged.
+- Both are stripped from the RPC trait method signature.
 
-Generate different extraction code depending on `ResolverKind`:
+## Codegen Changes (`plexus-macros/src/codegen/activation.rs`)
+
+For each dispatched method, after extracting the request struct and before deserializing RPC params:
 
 ```rust
-match &resolver.kind {
-    ResolverKind::FromAuth(expr) => {
-        // existing codegen — extract auth from req_ctx.auth
-        quote! {
-            let auth_ref = req_ctx.auth.as_ref()
-                .ok_or_else(|| PlexusError::Unauthenticated("Authentication required".to_string()))?;
-            let #param_name = (#expr)(auth_ref).await
-                .map_err(|e| PlexusError::ExecutionError(e.to_string()))?;
-        }
-    }
-    ResolverKind::FromRequest(expr) => {
-        // new codegen — pass full RequestContext to resolver
-        quote! {
-            let #param_name = (#expr)(req_ctx);
-        }
-    }
+// Generated dispatch wrapper (simplified):
+async fn __dispatch_list(
+    &self,
+    params: Value,
+    raw_ctx: Option<Arc<RawRequestContext>>,
+) -> PlexusStream {
+    // Stage 1: extract request struct (generated by hub_methods macro, see REQ-4)
+    let ctx = raw_ctx.as_deref().ok_or(PlexusError::Unauthenticated("no request context".into()))?;
+    let req = ClientsRequest::extract(ctx)?;
+
+    // Stage 2: inject #[from_request] fields
+    let auth_token: String = req.auth_token.clone();       // #[from_request] auth_token
+    let peer_addr: Option<SocketAddr> = req.peer_addr;     // #[from_request] peer_addr
+
+    // Stage 3: resolve #[from_auth] params
+    let auth_ref = req.auth.as_ref()
+        .ok_or_else(|| PlexusError::Unauthenticated("Authentication required".to_string()))?;
+    let user: ValidUser = self.db.validate_user(auth_ref).await
+        .map_err(|e| PlexusError::ExecutionError(e.to_string()))?;
+
+    // Stage 4: deserialize normal RPC params
+    let search: Option<String> = from_params(&params, "search")?;
+
+    // Stage 5: call method
+    self.list(auth_token, peer_addr, user, search).await
 }
 ```
 
-For `FromRequest`, if the resolver returns `Result<T>`, add `.map_err(...)`. If it returns `Option<T>` or `T`, use directly. The macro infers this from the parameter type or requires a trait bound.
+The macro knows the hub's request struct type from `#[hub_methods(request = ClientsRequest)]`. It uses the type name to generate `ClientsRequest::extract(ctx)?` and field accesses. Compile-time checks on field name/type come from the fact that the generated code is Rust — if `req.auth_token` is `String` and the method param declares `u32`, `rustc` reports the type error.
+
+## Compile-Time Field Validation
+
+The macro can optionally emit an explicit check using a helper trait:
+
+```rust
+// Generated for each #[from_request] param:
+const _: () = {
+    fn _check_field_exists(req: &ClientsRequest) -> &String {
+        &req.auth_token  // fails to compile if field doesn't exist or type doesn't match
+    }
+};
+```
+
+This gives an error at macro expansion time (during compilation) pointing at the `#[from_request]` site rather than deep inside generated code.
 
 ## Backward Compatibility
 
-- All existing `#[from_auth(expr)]` usages continue to compile and behave identically
-- No changes required in consumer crates (FormVeritas, etc.) for existing code
-- New `#[from_request(expr)]` is purely additive
+- All existing `#[from_auth(expr)]` usages compile and behave identically
+- No changes required in consumer crates for existing code
+- `#[from_request]` (no arguments) is purely additive
+- The old `#[from_request(expr)]` pattern (with expression arg) is NOT supported — if someone somehow has it, they'll get a parse error with a message explaining the new form
 
 ## Files
 
-- `plexus-macros/src/parse.rs` — add `ResolverKind`, update `extract_from_auth_attr`
-- `plexus-macros/src/codegen/activation.rs` — branch on `ResolverKind` in codegen
-- `plexus-core/src/plexus/plexus.rs` — pass `Arc<RequestContext>` (from REQ-1) instead of `Arc<AuthContext>` to dispatch; update `auth` extraction to `req_ctx.auth`
+| File | Repo | Change |
+|------|------|--------|
+| `plexus-macros/src/parse.rs` | plexus-macros | Add `MethodParam::FromRequest`, update attribute parsing |
+| `plexus-macros/src/codegen/activation.rs` | plexus-macros | Generate field injection for `FromRequest`; keep `FromAuth` codegen unchanged |
+| `plexus-core/src/plexus/plexus.rs` | plexus-core | Pass `Arc<RawRequestContext>` (from REQ-1) to dispatch; drop bare `Arc<AuthContext>` threading |
 
 ## Acceptance Criteria
 
-- [ ] `#[from_request(extract_origin)]` on a method param compiles and injects `Option<String>`
+- [ ] `#[from_request] auth_token: String` on a method param compiles and injects the correct value at call time
+- [ ] `#[from_request] nonexistent_field: String` (field not in hub's request struct) fails at compile time with a clear error message
+- [ ] `#[from_request] auth_token: u32` when field is `String` fails at compile time with a type mismatch error
 - [ ] `#[from_auth(self.db.validate_user)]` continues to work unchanged
-- [ ] A method can mix `#[from_auth]` and `#[from_request]` parameters
-- [ ] The generated code does not clone `RequestContext` unnecessarily
+- [ ] A method can mix `#[from_request]` and `#[from_auth]` params
+- [ ] `#[from_request]` params are stripped from the RPC method schema
+- [ ] Generated code does not clone `RawRequestContext` (moves or borrows field values from the extracted struct)
 - [ ] `cargo test` passes in plexus-macros
 
 ## Tests
 
 ### Compile tests — `plexus-macros/tests/compile/` (trybuild)
 
-These verify the macro accepts or rejects specific syntax. Each is a `.rs` file that must compile (or fail with the expected error).
-
-**`from_request_infallible.rs`** — must compile:
+**`from_request_field_injection.rs`** — must compile:
 ```rust
-#[hub_methods(namespace = "test")]
-impl MyActivation {
+#[derive(PlexusRequest, schemars::JsonSchema)]
+struct TestRequest {
+    #[from_cookie("access_token")]
+    auth_token: String,
+    #[from_header("origin")]
+    origin: Option<String>,
+}
+
+#[hub_methods(namespace = "test", request = TestRequest)]
+impl TestHub {
     async fn echo(
         &self,
-        #[from_request(extract_origin)] origin: Option<String>,
-    ) -> impl Stream<Item = String> { stream! { yield origin.unwrap_or_default(); } }
+        #[from_request] auth_token: String,
+        #[from_request] origin: Option<String>,
+    ) -> impl Stream<Item = String> {
+        stream! { yield format!("{} {:?}", auth_token, origin); }
+    }
 }
 ```
 
-**`from_request_fallible.rs`** — must compile (resolver returns `Result`):
+**`from_request_field_name_mismatch.rs`** — must FAIL with clear error:
 ```rust
-#[hub_methods(namespace = "test")]
-impl MyActivation {
-    async fn guarded(
+#[hub_methods(namespace = "test", request = TestRequest)]
+impl TestHub {
+    async fn bad(
         &self,
-        #[from_request(require_allowed_origin(&["http://localhost"]))] _: ValidOrigin,
-    ) -> impl Stream<Item = String> { stream! { yield "ok".into(); } }
+        #[from_request] nonexistent: String,   // ← field not in TestRequest
+    ) -> impl Stream<Item = String> { stream! { yield "x".into(); } }
+}
+// Expected: compile error mentioning "nonexistent" not found in TestRequest
+```
+
+**`from_request_type_mismatch.rs`** — must FAIL with type error:
+```rust
+#[hub_methods(namespace = "test", request = TestRequest)]
+impl TestHub {
+    async fn bad(
+        &self,
+        #[from_request] auth_token: u32,  // ← field is String, not u32
+    ) -> impl Stream<Item = String> { stream! { yield "x".into(); } }
 }
 ```
 
 **`from_auth_still_works.rs`** — must compile (backward compat):
 ```rust
-#[hub_methods(namespace = "test")]
-impl MyActivation {
+#[hub_methods(namespace = "test", request = TestRequest)]
+impl TestHub {
     async fn authed(
         &self,
         #[from_auth(self.db.validate_user)] user: ValidUser,
@@ -155,55 +201,52 @@ impl MyActivation {
 }
 ```
 
-**`mixed_from_auth_and_from_request.rs`** — must compile:
+**`mixed_from_request_and_from_auth.rs`** — must compile:
 ```rust
-async fn mixed(
-    &self,
-    #[from_request(extract_origin)] origin: Option<String>,
-    #[from_auth(self.db.validate_user)] user: ValidUser,
-    name: String,
-) -> ...
+#[hub_methods(namespace = "test", request = TestRequest)]
+impl TestHub {
+    async fn mixed(
+        &self,
+        #[from_request] auth_token: String,
+        #[from_auth(self.db.validate_user)] user: ValidUser,
+        name: String,
+    ) -> impl Stream<Item = String> { stream! { yield name; } }
+}
 ```
 
-**`from_request_stripped_from_schema.rs`** — verify the generated RPC trait excludes the `#[from_request]` param. The jsonrpsee RPC trait method must have signature `fn echo(&self, origin: Option<String>)` stripped to `fn echo(&self)`.
-
-### Unit — generated code correctness (`plexus-macros/tests/codegen.rs`)
-
-Expand the macro and assert the generated token stream contains the right extraction call:
-
+**`from_request_stripped_from_schema.rs`** — the RPC trait must not include `#[from_request]` params:
 ```rust
-// The generated dispatch for `#[from_request(extract_origin)] origin: Option<String>` must contain:
-//   let origin = extract_origin(req_ctx);
-// NOT:
-//   let origin = extract_origin(&auth_ctx);   ← wrong source
-
-// The generated dispatch for `#[from_auth(self.db.validate_user)] user: ValidUser` must contain:
-//   let auth_ref = req_ctx.auth.as_ref().ok_or_else(|| Unauthenticated(...))?;
-//   let user = self.db.validate_user(auth_ref).await...
+// Hub has method: fn echo(&self, #[from_request] auth_token: String, name: String)
+// Generated RPC trait must have: fn echo(&self, name: String)
+// Verify: generated schema for echo lists only "name" as a parameter
 ```
 
-### Runtime — method receives correct value
+### Runtime — method receives correct values
 
-Using a test server with `TestSessionValidator` and a stub activation:
+Using a test server with `TestSessionValidator` and the stub hub above:
 
 ```
-// from_request — Origin header present:
-// client sets Origin: http://test.local on WS upgrade
-// calls echo_origin()
-// assert response == Some("http://test.local")
+// #[from_request] auth_token — cookie present:
+// Client connects with Cookie: access_token=jwt123
+// Calls echo(name = "hello")
+// Response contains "jwt123"
 
-// from_request — Origin header absent:
-// client sets no Origin header
-// calls echo_origin()
-// assert response == None
+// #[from_request] origin — header present:
+// Client connects with Origin: http://test.local
+// Response contains "http://test.local"
 
-// from_auth — no token:
-// client connects without token
-// calls authed_method()
-// assert error code == -32001, message contains "Authentication required"
+// #[from_request] origin — header absent:
+// Response contains "None"
 
-// from_auth — valid token:
-// client connects with valid test token
-// calls authed_method()
-// assert response contains user_id from token
+// Required field missing (auth_token, no cookie):
+// Hub extraction fails before method → error code -32001
+
+// #[from_auth] — no token:
+// Client connects without token
+// Calls authed_method()
+// Error code -32001, message contains "Authentication required"
+
+// #[from_auth] — valid token:
+// Client connects with valid test token
+// Response contains user_id from token
 ```
