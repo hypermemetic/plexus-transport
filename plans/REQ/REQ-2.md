@@ -115,3 +115,95 @@ For `FromRequest`, if the resolver returns `Result<T>`, add `.map_err(...)`. If 
 - [ ] A method can mix `#[from_auth]` and `#[from_request]` parameters
 - [ ] The generated code does not clone `RequestContext` unnecessarily
 - [ ] `cargo test` passes in plexus-macros
+
+## Tests
+
+### Compile tests — `plexus-macros/tests/compile/` (trybuild)
+
+These verify the macro accepts or rejects specific syntax. Each is a `.rs` file that must compile (or fail with the expected error).
+
+**`from_request_infallible.rs`** — must compile:
+```rust
+#[hub_methods(namespace = "test")]
+impl MyActivation {
+    async fn echo(
+        &self,
+        #[from_request(extract_origin)] origin: Option<String>,
+    ) -> impl Stream<Item = String> { stream! { yield origin.unwrap_or_default(); } }
+}
+```
+
+**`from_request_fallible.rs`** — must compile (resolver returns `Result`):
+```rust
+#[hub_methods(namespace = "test")]
+impl MyActivation {
+    async fn guarded(
+        &self,
+        #[from_request(require_allowed_origin(&["http://localhost"]))] _: ValidOrigin,
+    ) -> impl Stream<Item = String> { stream! { yield "ok".into(); } }
+}
+```
+
+**`from_auth_still_works.rs`** — must compile (backward compat):
+```rust
+#[hub_methods(namespace = "test")]
+impl MyActivation {
+    async fn authed(
+        &self,
+        #[from_auth(self.db.validate_user)] user: ValidUser,
+    ) -> impl Stream<Item = String> { stream! { yield user.id().to_string(); } }
+}
+```
+
+**`mixed_from_auth_and_from_request.rs`** — must compile:
+```rust
+async fn mixed(
+    &self,
+    #[from_request(extract_origin)] origin: Option<String>,
+    #[from_auth(self.db.validate_user)] user: ValidUser,
+    name: String,
+) -> ...
+```
+
+**`from_request_stripped_from_schema.rs`** — verify the generated RPC trait excludes the `#[from_request]` param. The jsonrpsee RPC trait method must have signature `fn echo(&self, origin: Option<String>)` stripped to `fn echo(&self)`.
+
+### Unit — generated code correctness (`plexus-macros/tests/codegen.rs`)
+
+Expand the macro and assert the generated token stream contains the right extraction call:
+
+```rust
+// The generated dispatch for `#[from_request(extract_origin)] origin: Option<String>` must contain:
+//   let origin = extract_origin(req_ctx);
+// NOT:
+//   let origin = extract_origin(&auth_ctx);   ← wrong source
+
+// The generated dispatch for `#[from_auth(self.db.validate_user)] user: ValidUser` must contain:
+//   let auth_ref = req_ctx.auth.as_ref().ok_or_else(|| Unauthenticated(...))?;
+//   let user = self.db.validate_user(auth_ref).await...
+```
+
+### Runtime — method receives correct value
+
+Using a test server with `TestSessionValidator` and a stub activation:
+
+```
+// from_request — Origin header present:
+// client sets Origin: http://test.local on WS upgrade
+// calls echo_origin()
+// assert response == Some("http://test.local")
+
+// from_request — Origin header absent:
+// client sets no Origin header
+// calls echo_origin()
+// assert response == None
+
+// from_auth — no token:
+// client connects without token
+// calls authed_method()
+// assert error code == -32001, message contains "Authentication required"
+
+// from_auth — valid token:
+// client connects with valid test token
+// calls authed_method()
+// assert response contains user_id from token
+```

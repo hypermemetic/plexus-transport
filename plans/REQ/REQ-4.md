@@ -173,3 +173,112 @@ A hub can use both: the validator provides a uniform early rejection, the per-me
 - [ ] A hub can declare both validators and extractors simultaneously
 - [ ] Existing hubs with no `validate`/`extract` annotations are unaffected (backward compatible)
 - [ ] `cargo test` passes in plexus-macros
+
+## Tests
+
+### Compile tests — `plexus-macros/tests/compile/` (trybuild)
+
+**`hub_validate_compiles.rs`** — must compile:
+```rust
+#[hub_methods(namespace = "test", validate = [require_authenticated])]
+impl TestHub {
+    async fn list(&self) -> impl Stream<Item = String> { stream! { yield "ok".into(); } }
+    async fn get(&self, id: String) -> impl Stream<Item = String> { stream! { yield id; } }
+}
+// Neither method has #[from_auth] — auth comes entirely from hub validator
+```
+
+**`hub_extract_compiles.rs`** — must compile:
+```rust
+#[hub_methods(namespace = "test",
+    extract = [peer_addr: Option<SocketAddr> = extract_peer_addr])]
+impl TestHub {
+    async fn with_peer(&self, #[from_hub] peer_addr: Option<SocketAddr>) -> ... { ... }
+    async fn without_peer(&self, name: String) -> ... { ... }  // no #[from_hub] — must still compile
+}
+```
+
+**`hub_validate_and_extract_compiles.rs`** — must compile:
+```rust
+#[hub_methods(namespace = "test",
+    validate = [require_authenticated, require_cors(ALLOWED)],
+    extract  = [origin: Option<String> = extract_origin])]
+impl TestHub {
+    async fn method(&self, #[from_hub] origin: Option<String>) -> ... { ... }
+}
+```
+
+**`hub_no_annotations_unchanged.rs`** — existing hub with no validate/extract must compile identically to before:
+```rust
+#[hub_methods(namespace = "test", version = "1.0.0", description = "...")]
+impl TestHub {
+    async fn plain(&self, x: i32) -> impl Stream<Item = i32> { stream! { yield x; } }
+}
+```
+
+### Unit — validator ordering and short-circuit (`plexus-macros/tests/hub_dispatch.rs`)
+
+Use a test server with `TestSessionValidator`.
+
+```
+// Validator short-circuit:
+// Hub declares validate = [require_authenticated, require_cors(ALLOWED)]
+// Unauthenticated request with allowed Origin:
+//   → require_authenticated fires first → returns -32001
+//   → require_cors never runs (it would have passed)
+// Verify: error is -32001 (not a CORS error)
+
+// Both validators pass:
+// Authenticated request with allowed Origin → method body executes → returns data
+
+// Second validator fails:
+// Authenticated request with disallowed Origin
+//   → require_authenticated passes
+//   → require_cors fires → returns -32001 with "Origin" in message
+
+// Validator failure before extractor:
+// Hub declares validate = [require_authenticated], extract = [peer_addr = extract_peer_addr]
+// Unauthenticated request → validator fails → extractor is never called
+// Verify: no panic, no partial extraction
+```
+
+### Unit — extractor opt-in behaviour
+
+```
+// Hub declares extract = [peer_addr: Option<SocketAddr> = extract_peer_addr]
+// Method A declares #[from_hub] peer_addr: Option<SocketAddr>
+// Method B declares no #[from_hub]
+
+// Call method A from client at 127.0.0.1:9999:
+//   → peer_addr == Some(127.0.0.1:9999)
+
+// Call method B:
+//   → method body runs normally, no peer_addr param, no error
+
+// Hub extractor failure:
+// Hub declares extract = [user_data: UserData = fallible_extractor] where fallible_extractor returns Err
+// Call any method → method returns the extractor's error before body runs
+// Verify: error has correct PlexusError variant and message
+```
+
+### Unit — `#[from_hub]` type mismatch (compile error)
+
+**`hub_extract_type_mismatch.rs`** — must FAIL to compile with a clear error:
+```rust
+// Hub declares:  extract = [peer_addr: Option<SocketAddr> = extract_peer_addr]
+// Method declares: #[from_hub] peer_addr: String  ← wrong type
+// Expected error: type mismatch, expected Option<SocketAddr>, found String
+```
+
+### Integration — FormVeritas ClientsActivation
+
+After applying REQ-4 to `ClientsActivation`:
+
+```
+// Remove all per-method #[from_request(require_allowed_origin)] annotations
+// Add to hub annotation: validate = [require_authenticated, require_cors(ALLOWED_ORIGINS)]
+// Run all 99 Playwright tests → must still pass
+// Run: unauthenticated websocat call to clients.list → -32001
+// Run: websocat with wrong Origin → -32001 with "Origin" in message
+// Verify: no per-method auth annotation needed on any of the 5 client methods
+```

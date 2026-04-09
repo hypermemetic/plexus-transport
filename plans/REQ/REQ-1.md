@@ -155,3 +155,93 @@ REQ-1
 - [ ] `#[from_auth(expr)]` continues to work unchanged (backward compatible)
 - [ ] `#[from_request(extract_origin)]` compiles and returns `Option<String>` at method call time
 - [ ] No HTTP headers are cloned unnecessarily for connections that don't use `#[from_request]`
+
+## Tests
+
+### Unit — extractor stdlib (`plexus-transport/tests/extractors.rs`)
+
+Each extractor must be testable with a hand-constructed `RequestContext` — no HTTP server, no WebSocket.
+
+```rust
+fn make_ctx(headers: &[(&str, &str)]) -> RequestContext {
+    let mut h = http::HeaderMap::new();
+    for (k, v) in headers {
+        h.insert(http::header::HeaderName::from_static(k), v.parse().unwrap());
+    }
+    RequestContext { headers: h, uri: "/".parse().unwrap(), auth: None, peer: None }
+}
+
+// extract_origin
+#[test] fn extract_origin_present() {
+    let ctx = make_ctx(&[("origin", "https://app.example.com")]);
+    assert_eq!(extract_origin(&ctx), Some("https://app.example.com".into()));
+}
+#[test] fn extract_origin_absent() {
+    let ctx = make_ctx(&[]);
+    assert_eq!(extract_origin(&ctx), None);
+}
+
+// extract_cookie
+#[test] fn extract_cookie_present() {
+    let ctx = make_ctx(&[("cookie", "session=abc; token=xyz")]);
+    assert_eq!(extract_cookie("session")(&ctx), Some("abc".into()));
+    assert_eq!(extract_cookie("token")(&ctx),   Some("xyz".into()));
+}
+#[test] fn extract_cookie_absent() {
+    let ctx = make_ctx(&[("cookie", "other=val")]);
+    assert_eq!(extract_cookie("session")(&ctx), None);
+}
+#[test] fn extract_cookie_no_cookie_header() {
+    let ctx = make_ctx(&[]);
+    assert_eq!(extract_cookie("session")(&ctx), None);
+}
+
+// extract_peer_addr
+#[test] fn extract_peer_addr_present() {
+    let ctx = RequestContext { peer: Some("1.2.3.4:5678".parse().unwrap()), ..make_ctx(&[]) };
+    assert_eq!(extract_peer_addr(&ctx), Some("1.2.3.4:5678".parse().unwrap()));
+}
+#[test] fn extract_peer_addr_absent() {
+    assert_eq!(extract_peer_addr(&make_ctx(&[])), None);
+}
+
+// extract_header (generic)
+#[test] fn extract_header_present() {
+    let ctx = make_ctx(&[("x-request-id", "req-123")]);
+    assert_eq!(extract_header("x-request-id")(&ctx), Some("req-123".into()));
+}
+#[test] fn extract_header_absent() {
+    assert_eq!(extract_header("x-request-id")(&make_ctx(&[])), None);
+}
+```
+
+### Unit — auth field forwarding
+
+```rust
+#[test] fn request_context_carries_auth() {
+    let auth = AuthContext { user_id: "u1".into(), session_id: "s1".into(),
+                             roles: vec![], metadata: Default::default() };
+    let ctx = RequestContext { auth: Some(auth.clone()), ..make_ctx(&[]) };
+    assert_eq!(ctx.auth.as_ref().unwrap().user_id, "u1");
+}
+
+#[test] fn request_context_no_auth_is_none() {
+    let ctx = make_ctx(&[]);
+    assert!(ctx.auth.is_none());
+}
+```
+
+### Integration — Extensions wiring (`plexus-transport/tests/integration.rs`)
+
+Requires a running test server using `TestSessionValidator`.
+
+```rust
+// Start a server, connect a client, call a method that reads from RequestContext.
+// Verify the method receives the correct header values.
+//
+// Test method: echo_origin(#[from_request(extract_origin)] origin: Option<String>) -> origin
+//
+// Case 1: client connects with Origin header set → method returns Some("http://test.local")
+// Case 2: client connects without Origin header → method returns None
+// Case 3: authenticated client → ctx.auth is Some; unauthenticated → ctx.auth is None
+```

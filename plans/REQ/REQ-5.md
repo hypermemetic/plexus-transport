@@ -199,3 +199,128 @@ This is a warning, not a hard failure — the actual rejection comes from the se
 - [ ] `synapse backend forms list` (hub with no security declaration) unaffected
 - [ ] `require_cors` validator does not block synapse (no Origin header = allowed through)
 - [ ] Hub extractor parameters (`#[from_hub]`) do not appear in synapse's method help (stripped by macro)
+
+## Tests
+
+### Haskell unit tests — `synapse/test/` (HSpec or Tasty)
+
+**`renderPluginSecurity`:**
+```haskell
+describe "renderPluginSecurity" $ do
+  it "includes auth notice when require_authenticated is a validator" $ do
+    let sec = PluginSecurity
+          { psSecValidators = [SecurityValidator "require_authenticated" Nothing]
+          , psSecExtractors = []
+          }
+    renderPluginSecurity sec `shouldContain` "Authentication required"
+    renderPluginSecurity sec `shouldContain` "--token"
+    renderPluginSecurity sec `shouldContain` "SYNAPSE_TOKEN"
+
+  it "returns empty string when no validators" $ do
+    let sec = PluginSecurity { psSecValidators = [], psSecExtractors = [] }
+    renderPluginSecurity sec `shouldBe` ""
+
+  it "does not show auth notice for non-auth validators" $ do
+    let sec = PluginSecurity
+          { psSecValidators = [SecurityValidator "require_cors" (Just ["https://app.example.com"])]
+          , psSecExtractors = []
+          }
+    renderPluginSecurity sec `shouldNotContain` "Authentication required"
+```
+
+**`resolveToken` — SYNAPSE_TOKEN env var:**
+```haskell
+describe "resolveToken" $ do
+  it "returns SYNAPSE_TOKEN when set and no --token flag" $
+    withEnv [("SYNAPSE_TOKEN", "env-jwt")] $ do
+      result <- resolveToken defaultOpts "mybackend"
+      result `shouldBe` Just "env-jwt"
+
+  it "--token flag takes priority over SYNAPSE_TOKEN" $
+    withEnv [("SYNAPSE_TOKEN", "env-jwt")] $ do
+      result <- resolveToken (defaultOpts { soToken = Just "flag-jwt" }) "mybackend"
+      result `shouldBe` Just "flag-jwt"
+
+  it "falls through to file when SYNAPSE_TOKEN absent" $
+    withEnv [] $ do
+      -- No env var, no flag, no file → Nothing
+      result <- resolveToken defaultOpts "nonexistent-backend"
+      result `shouldBe` Nothing
+```
+
+**`renderError` — -32001 hint:**
+```haskell
+describe "renderError" $ do
+  it "includes --token hint on -32001" $ do
+    let err = RpcError (-32001) "Authentication required: no token" Nothing
+    renderError err `shouldContain` "--token"
+    renderError err `shouldContain` "SYNAPSE_TOKEN"
+
+  it "renders other errors without token hint" $ do
+    let err = RpcError (-32000) "Execution error" Nothing
+    renderError err `shouldNotContain` "SYNAPSE_TOKEN"
+
+  it "includes original message in -32001 output" $ do
+    let err = RpcError (-32001) "This method requires authentication" Nothing
+    renderError err `shouldContain` "This method requires authentication"
+```
+
+**`PluginSchema` JSON roundtrip — security field:**
+```haskell
+describe "PluginSchema JSON" $ do
+  it "decodes psSecurity when present" $ do
+    let json = [aesonQQ| {
+          "namespace": "clients", "version": "1.0.0", "description": "...",
+          "methods": [], "hash": "abc",
+          "security": {
+            "validators": [{"name": "require_authenticated"}],
+            "extractors": []
+          }
+        } |]
+    let schema = decode json :: Maybe PluginSchema
+    (psSecurity =<< schema) `shouldSatisfy` isJust
+
+  it "psSecurity is Nothing when field absent" $ do
+    let json = [aesonQQ| {"namespace":"x","version":"1","description":"","methods":[],"hash":"a"} |]
+    let schema = fromJust $ decode json :: PluginSchema
+    psSecurity schema `shouldBe` Nothing
+```
+
+### CLI integration tests — `synapse/test/cli-test/` (requires running backend)
+
+These require a backend server with a `clients` hub (REQ-4 `require_authenticated`) and a `forms` hub (no security).
+
+```
+-- Auth notice in help:
+synapse backend clients
+  stdout must contain "Authentication required"
+  stdout must contain "--token" or "SYNAPSE_TOKEN"
+
+-- Auth notice absent for unsecured hub:
+synapse backend forms
+  stdout must NOT contain "Authentication required"
+
+-- -32001 error message:
+synapse backend clients list   (no token)
+  stderr must contain "Authentication required"
+  stderr must contain "--token"
+  exit code must be non-zero
+
+-- SYNAPSE_TOKEN env var:
+SYNAPSE_TOKEN=<valid-jwt> synapse backend clients list
+  exit code == 0
+  stdout contains client data
+
+-- --token flag (existing behavior):
+synapse --token <valid-jwt> backend clients list
+  exit code == 0
+
+-- CORS: synapse has no Origin header → require_cors passes:
+synapse --token <valid-jwt> backend clients list
+  exit code == 0   (even if server has require_cors validator)
+
+-- Hub extractor params stripped from method help:
+synapse --token <valid-jwt> backend clients list --help
+  stdout must NOT contain "peer_addr"
+  stdout must NOT contain "origin" as a parameter name
+```
