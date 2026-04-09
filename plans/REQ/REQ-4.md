@@ -138,6 +138,52 @@ async fn __dispatch_list(&self, params: Value, req_ctx: Option<Arc<RequestContex
 
 Methods with `#[from_hub(name)]` receive the pre-extracted value. Methods without it don't receive it (the value is computed but not passed).
 
+### Request Contract Inference
+
+For each extractor in the `extract = [...]` list, the macro also infers a `ContractEntry` (see REQ-1 Layer 3b) to include in the wire schema. This tells clients what HTTP-level data the hub needs on WS upgrade — NOT the Rust type the extractor produces.
+
+```rust
+// The macro looks up the extractor function name in the stdlib registry to determine
+// ContractSource. Unknown functions default to Derived.
+fn infer_contract(extractor_fn: &str, extract_key: Option<&str>) -> ContractEntry {
+    match extractor_fn {
+        "extract_origin" | "require_allowed_origin" =>
+            ContractEntry { source: Header, key: Some("origin".into()), required: false, .. }
+        "extract_peer_addr" =>
+            ContractEntry { source: Derived, key: None, required: false, .. }
+        "extract_cookie" =>
+            ContractEntry { source: Cookie, key: extract_key.map(Into::into), required: false, .. }
+        "extract_header" =>
+            ContractEntry { source: Header, key: extract_key.map(Into::into), required: false, .. }
+        _ =>
+            ContractEntry { source: Derived, key: None, required: false,
+                            description: format!("server-derived: {}", extractor_fn) }
+    }
+}
+```
+
+Validators are NOT included in the request contract. They are pure gates. However, `require_authenticated` implies that the `access_token` cookie must be present — the macro emits a `ContractEntry { source: Cookie, key: Some("access_token"), required: true }` when it sees `require_authenticated` in the `validate` list. This is the one exception where a validator drives a contract entry, because the cookie is what auth validation checks.
+
+The serialized wire schema for `security` becomes:
+
+```json
+{
+  "security": {
+    "validators": [
+      {"name": "require_authenticated"},
+      {"name": "require_cors", "params": ["https://app.formveritas.com"]}
+    ],
+    "request_contract": [
+      {"source": "Cookie", "key": "access_token", "required": true,  "description": "JWT auth token"},
+      {"source": "Derived", "key": null,           "required": false, "description": "server-derived: extract_peer_addr"},
+      {"source": "Header",  "key": "origin",       "required": false, "description": "Origin header"}
+    ]
+  }
+}
+```
+
+Note: `seTypeName` / Rust type strings do NOT appear in the wire schema. The schema says "I need a cookie named `access_token`", not "I produce a value of type `Option<AuthContext>`". Type names are a server-side implementation detail.
+
 ## Why Not Just Middleware
 
 Middleware runs at the transport layer — before routing, before method dispatch, with no knowledge of which activation or method is being called. Hub-level validators run after routing, inside the activation, with full knowledge of the hub's identity and configuration. This means:
@@ -158,11 +204,14 @@ A hub can use both: the validator provides a uniform early rejection, the per-me
 
 ## Files
 
-- `plexus-macros/src/parse.rs` — parse `validate = [...]` and `extract = [...]` in `hub_methods` attr
-- `plexus-macros/src/codegen/activation.rs` — generate validator/extractor dispatch wrapper
-- `plexus-macros/src/codegen/hub.rs` — hub-level context struct holding extracted values
-- `plexus-transport/src/extractors/validators.rs` — `require_authenticated`, `require_cors`, `require_role`
-- `plexus-transport/src/lib.rs` — re-export validators
+| File | Repo | Change |
+|------|------|--------|
+| `plexus-macros/src/parse.rs` | plexus-macros | Parse `validate = [...]` and `extract = [...]` in `hub_methods` attr |
+| `plexus-macros/src/codegen/activation.rs` | plexus-macros | Generate validator/extractor dispatch wrapper; call `infer_contract` per extractor |
+| `plexus-macros/src/codegen/hub.rs` | plexus-macros | Hub-level context struct holding extracted values |
+| `plexus-transport/src/extractors/validators.rs` | plexus-transport | `require_authenticated`, `require_cors`, `require_role` |
+| `plexus-transport/src/extractors/contract.rs` | plexus-transport | `ContractEntry`, `ContractSource`, stdlib extractor → ContractEntry mapping |
+| `plexus-transport/src/lib.rs` | plexus-transport | Re-export validators, `ContractEntry`, `ContractSource` |
 
 ## Acceptance Criteria
 
@@ -172,6 +221,8 @@ A hub can use both: the validator provides a uniform early rejection, the per-me
 - [ ] Methods that do not declare `#[from_hub]` compile and run correctly — hub extractors don't affect their signatures
 - [ ] A hub can declare both validators and extractors simultaneously
 - [ ] Existing hubs with no `validate`/`extract` annotations are unaffected (backward compatible)
+- [ ] Hub with `extract = [peer_addr: Option<SocketAddr> = extract_peer_addr]` serializes as `ContractEntry { source: Derived }` in the wire schema — NOT as `{ type_name: "Option<SocketAddr>" }`
+- [ ] Hub with `validate = [require_authenticated]` serializes a `ContractEntry { source: Cookie, key: "access_token", required: true }` in `request_contract`
 - [ ] `cargo test` passes in plexus-macros
 
 ## Tests
@@ -270,6 +321,23 @@ Use a test server with `TestSessionValidator`.
 // Expected error: type mismatch, expected Option<SocketAddr>, found String
 ```
 
+### Unit — request contract inference
+
+```rust
+// Hub with extract = [peer_addr: Option<SocketAddr> = extract_peer_addr]
+// Verify the serialized schema security.request_contract contains:
+//   { "source": "Derived", "key": null, "required": false }
+// And does NOT contain any Rust type string.
+
+// Hub with validate = [require_authenticated]
+// Verify the serialized schema security.request_contract contains:
+//   { "source": "Cookie", "key": "access_token", "required": true }
+
+// Hub with extract = [origin: Option<String> = extract_origin]
+// Verify the serialized schema security.request_contract contains:
+//   { "source": "Header", "key": "origin", "required": false }
+```
+
 ### Integration — FormVeritas ClientsActivation
 
 After applying REQ-4 to `ClientsActivation`:
@@ -281,4 +349,5 @@ After applying REQ-4 to `ClientsActivation`:
 // Run: unauthenticated websocat call to clients.list → -32001
 // Run: websocat with wrong Origin → -32001 with "Origin" in message
 // Verify: no per-method auth annotation needed on any of the 5 client methods
+// Verify: clients hub schema request_contract shows Cookie access_token (required)
 ```

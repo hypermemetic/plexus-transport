@@ -82,6 +82,50 @@ pub fn extract_header(name: &'static str)
     -> impl Fn(&RequestContext) -> Option<String>;
 ```
 
+### Layer 3b — Request Contract
+
+Each stdlib extractor maps to a `ContractEntry` — a client-facing declaration of what HTTP-level data the extractor needs to function. This is separate from the Rust type the extractor produces. The contract is purely for clients to know what to send on WS upgrade; the server still processes the raw request internally.
+
+**Key types:**
+
+```rust
+// Where the data lives in the HTTP request (client's perspective)
+pub enum ContractSource {
+    Cookie,      // client sends Cookie: name=value on WS upgrade
+    Header,      // client sends an HTTP header on WS upgrade
+    QueryParam,  // client appends ?key=value to the WS upgrade URI
+    Derived,     // computed server-side (peer_addr, etc.) — client cannot supply this
+}
+
+// One entry per extractor that requires client-supplied data
+pub struct ContractEntry {
+    pub source:      ContractSource,
+    pub key:         Option<String>,  // header/cookie/param name; None for Derived
+    pub required:    bool,
+    pub description: String,
+}
+```
+
+**Mapping of stdlib extractors to ContractEntry:**
+
+| Extractor | ContractSource | key | required | Notes |
+|-----------|----------------|-----|----------|-------|
+| `extract_origin` | `Header` | `"origin"` | false | Browser sends automatically |
+| `extract_cookie("name")` | `Cookie` | `name` | false | Client must include in Cookie header |
+| `extract_header("name")` | `Header` | `name` | false | Client must include the header |
+| `extract_peer_addr` | `Derived` | None | false | TCP network state — client cannot control |
+| `extract_uri` | `Derived` | None | false | WS upgrade URI — always present |
+| `require_allowed_origin(...)` | — | — | — | Validator, not an extractor. No ContractEntry needed. |
+
+**Validators do not produce ContractEntries.** They are pure gates that accept or reject a request — they don't declare anything the client needs to provide. A validator like `require_allowed_origin` checks the `origin` header but does not require the client to do anything beyond what a browser does automatically.
+
+**Unknown extractor functions** (user-defined, not in the stdlib registry) default to `ContractEntry { source: Derived, key: None, required: false }`. The macro cannot infer their transport semantics.
+
+The contract lives in the wire schema (see REQ-4, REQ-5) so that clients like the synapse CLI can:
+- Show "Request requirements" in `--help` output
+- Proactively warn when required entries have no corresponding value configured
+- Accept generic `--cookie`/`--header`/`--query` flags to satisfy arbitrary contracts
+
 ### Layer 4 — Macro generalization (plexus-macros)
 
 Generalize `#[from_auth(expr)]` to `#[from_request(expr)]` where `expr` receives a `&RequestContext` instead of `&AuthContext`.
@@ -124,7 +168,7 @@ _origin_check: (),
 ## Tickets
 
 ```
-REQ-1  (this)   RequestContext type, Extensions wiring, extractor stdlib
+REQ-1  (this)   RequestContext type, Extensions wiring, extractor stdlib, ContractEntry types
 REQ-2           Macro: generalize #[from_auth] → #[from_request]
 REQ-3           AUTH-18 implementation using REQ extractors (Origin validation)
 ```
@@ -143,10 +187,11 @@ REQ-1
 | File | Repo | Change |
 |------|------|--------|
 | `src/websocket.rs` | plexus-transport | Insert `Arc<RequestContext>` into Extensions alongside `Arc<AuthContext>` |
-| `src/lib.rs` | plexus-transport | Export `RequestContext`, standard extractors |
+| `src/lib.rs` | plexus-transport | Export `RequestContext`, standard extractors, `ContractEntry`, `ContractSource` |
+| `src/extractors/contract.rs` | plexus-transport | `ContractEntry`, `ContractSource`, stdlib extractor → ContractEntry mapping |
 | `src/plexus/plexus.rs` | plexus-core | Extract `Arc<RequestContext>` instead of bare `Arc<AuthContext>` |
 | `src/parse.rs` | plexus-macros | Add `from_request` as synonym for `from_auth` with `RequestContext` input |
-| `src/codegen/activation.rs` | plexus-macros | Generate `req_ctx` extraction, pass to resolver exprs |
+| `src/codegen/activation.rs` | plexus-macros | Generate `req_ctx` extraction, pass to resolver exprs; infer ContractEntry per extractor |
 
 ## Acceptance Criteria
 
@@ -155,6 +200,8 @@ REQ-1
 - [ ] `#[from_auth(expr)]` continues to work unchanged (backward compatible)
 - [ ] `#[from_request(extract_origin)]` compiles and returns `Option<String>` at method call time
 - [ ] No HTTP headers are cloned unnecessarily for connections that don't use `#[from_request]`
+- [ ] `ContractEntry` metadata is attached to each extractor function in the stdlib
+- [ ] `extract_peer_addr` has `ContractSource::Derived`; `extract_cookie("access_token")` has `ContractSource::Cookie` with `key = Some("access_token")`
 
 ## Tests
 
@@ -215,6 +262,31 @@ fn make_ctx(headers: &[(&str, &str)]) -> RequestContext {
 }
 ```
 
+### Unit — ContractEntry metadata (`plexus-transport/tests/contract.rs`)
+
+```rust
+#[test] fn extract_peer_addr_contract() {
+    let entry = extract_peer_addr_contract();
+    assert_eq!(entry.source, ContractSource::Derived);
+    assert!(entry.key.is_none());
+    assert!(!entry.required);
+}
+
+#[test] fn extract_cookie_contract() {
+    let entry = extract_cookie_contract("access_token");
+    assert_eq!(entry.source, ContractSource::Cookie);
+    assert_eq!(entry.key.as_deref(), Some("access_token"));
+    assert!(!entry.required);
+}
+
+#[test] fn extract_origin_contract() {
+    let entry = extract_origin_contract();
+    assert_eq!(entry.source, ContractSource::Header);
+    assert_eq!(entry.key.as_deref(), Some("origin"));
+    assert!(!entry.required);
+}
+```
+
 ### Unit — auth field forwarding
 
 ```rust
@@ -245,3 +317,16 @@ Requires a running test server using `TestSessionValidator`.
 // Case 2: client connects without Origin header → method returns None
 // Case 3: authenticated client → ctx.auth is Some; unauthenticated → ctx.auth is None
 ```
+
+## Open Design Questions
+
+**Q1: Should `ContractEntry` include JSON Schema type information for the expected value?**
+
+No — not in v1. `ContractEntry` is about transport-level routing (where to put data), not type validation. Rust type names like `Option<SocketAddr>` are meaningless to Haskell clients. If code generation tools (OpenAPI, client SDKs) need type info later, add it then. For now, the client only needs to know *where* to send the data, not what shape to validate it.
+
+**Q2: Should synapse use a generic passthrough mode (like websocat with raw flags) or schema-driven flag generation?**
+
+Schema-driven, with a fallback to generic flags. Schema-driven is better because:
+- `--help` can explain exactly what's required ("Cookie access_token (required): JWT auth token")
+- Required entries can be proactively checked before connecting
+- The generic `--cookie key=value`, `--header key=value`, `--query key=value` flags handle unknown or user-defined extractors that produce `ContractDerived` or have no schema entry
