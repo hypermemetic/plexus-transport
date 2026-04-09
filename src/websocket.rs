@@ -27,27 +27,24 @@ pub async fn serve_websocket(
 ) -> Result<ServerHandle> {
     tracing::info!("Starting WebSocket transport at ws://{}", config.addr);
 
-    #[cfg(feature = "mcp-gateway")]
-    {
-        let has_bearer = config.api_key.is_some();
-        let has_cookies = session_validator.is_some();
+    let has_bearer = config.api_key.is_some();
+    let has_session = session_validator.is_some();
 
-        if has_bearer || has_cookies {
-            let expected_bearer = config.api_key.map(|key| format!("Bearer {}", key));
-            let middleware = tower::ServiceBuilder::new().layer_fn(move |service| {
-                CombinedAuthMiddleware {
-                    service,
-                    expected_bearer: expected_bearer.clone(),
-                    session_validator: session_validator.clone(),
-                }
-            });
-            let server = Server::builder()
-                .set_http_middleware(middleware)
-                .build(config.addr)
-                .await?;
-            let handle = server.start(module);
-            return Ok(handle);
-        }
+    if has_bearer || has_session {
+        let expected_bearer = config.api_key.map(|key| format!("Bearer {}", key));
+        let middleware = tower::ServiceBuilder::new().layer_fn(move |service| {
+            CombinedAuthMiddleware {
+                service,
+                expected_bearer: expected_bearer.clone(),
+                session_validator: session_validator.clone(),
+            }
+        });
+        let server = Server::builder()
+            .set_http_middleware(middleware)
+            .build(config.addr)
+            .await?;
+        let handle = server.start(module);
+        return Ok(handle);
     }
 
     let server = Server::builder().build(config.addr).await?;
@@ -61,7 +58,6 @@ pub async fn serve_websocket(
 // (only compiled when the mcp-gateway feature is active)
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "mcp-gateway")]
 mod auth {
     use std::future::Future;
     use std::pin::Pin;
@@ -107,6 +103,8 @@ mod auth {
         }
 
         fn call(&mut self, mut request: HttpRequest<B>) -> Self::Future {
+            let service = self.service.clone();
+
             // Check Bearer token if configured
             if let Some(ref expected) = self.expected_bearer {
                 let auth_ok = request
@@ -131,40 +129,63 @@ mod auth {
                 }
             }
 
-            // Extract and validate cookies if validator is configured
+            // Extract and validate session if validator is configured.
+            // Tries in order: Cookie header, then ?token= query parameter.
             let session_validator = self.session_validator.clone();
-            if let Some(validator) = session_validator.clone() {
-                if let Some(cookie_header) = request.headers().get(http::header::COOKIE) {
-                    if let Ok(cookie_str) = cookie_header.to_str() {
-                        // Spawn async validation task
-                        let cookie_str_owned = cookie_str.to_string();
-                        return Box::pin(async move {
-                            // Validate cookie and get auth context
-                            if let Some(auth_ctx) = validator.validate(&cookie_str_owned).await {
-                                tracing::debug!("Cookie validation successful for user: {}", auth_ctx.user_id);
-                                // Store AuthContext in request Extensions for RPC handlers
-                                // Extensions are propagated through jsonrpsee to the RPC methods
-                                request.extensions_mut().insert(Arc::new(auth_ctx));
-                            } else {
-                                tracing::debug!("Cookie validation failed, proceeding without auth");
-                                // Cookie invalid - proceed without auth (methods can handle anonymous access)
-                            }
+            if let Some(validator) = session_validator {
+                // Collect the cookie string and/or token query param
+                let cookie_str = request.headers()
+                    .get(http::header::COOKIE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
 
-                            // Forward the request with modified extensions
-                            let mut service = self.service.clone();
-                            service.call(request).await.map_err(Into::into)
-                        });
-                    }
+                let query_token = request.uri().query().and_then(|q| {
+                    form_urlencoded::parse(q.as_bytes())
+                        .find(|(k, _)| k == "token")
+                        .map(|(_, v)| v.to_string())
+                });
+
+                if cookie_str.is_some() || query_token.is_some() {
+                    let mut service = service;
+                    return Box::pin(async move {
+                        let mut auth_ctx = None;
+
+                        // Try cookie first
+                        if let Some(ref cookies) = cookie_str {
+                            auth_ctx = validator.validate(cookies).await;
+                            if auth_ctx.is_some() {
+                                tracing::debug!("Cookie validation successful");
+                            }
+                        }
+
+                        // Fall back to ?token= query parameter
+                        if auth_ctx.is_none() {
+                            if let Some(ref token) = query_token {
+                                auth_ctx = validator.validate(token).await;
+                                if auth_ctx.is_some() {
+                                    tracing::debug!("Token query param validation successful");
+                                }
+                            }
+                        }
+
+                        if let Some(ctx) = auth_ctx {
+                            tracing::debug!("Auth resolved for user: {}", ctx.user_id);
+                            request.extensions_mut().insert(Arc::new(ctx));
+                        } else {
+                            tracing::debug!("No valid auth found, proceeding without");
+                        }
+
+                        service.call(request).await.map_err(Into::into)
+                    });
                 }
-                tracing::debug!("No cookie header present, proceeding without auth");
+                tracing::debug!("No cookie or token query param, proceeding without auth");
             }
 
-            // No auth required or no cookie present - pass through
-            let fut = self.service.call(request);
-            Box::pin(async move { fut.await.map_err(Into::into) })
+            // No auth configured - pass through
+            let mut service = service;
+            Box::pin(async move { service.call(request).await.map_err(Into::into) })
         }
     }
 }
 
-#[cfg(feature = "mcp-gateway")]
 use auth::CombinedAuthMiddleware;

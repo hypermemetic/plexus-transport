@@ -18,15 +18,15 @@ tracing = "0.1"
 # JSON-RPC and WebSocket
 jsonrpsee = { version = "0.26", features = ["server"] }
 hyper = { version = "1", features = ["full"], optional = true }
-bytes = { version = "1", optional = true }
-http-body = { version = "1", optional = true }
+bytes = "1"
+http-body = "1"
 
 # MCP protocol
 rmcp = { version = "0.12", features = ["server", "transport-streamable-http-server"] }
 
 # HTTP server
 axum = "0.8"
-tower = { version = "0.5", features = ["util"], optional = true }
+tower = { version = "0.5", features = ["util"] }
 http = "1.0"  # For extracting HTTP request parts from RequestContext
 form_urlencoded = "1.2"  # For parsing query parameters
 
@@ -46,6 +46,6 @@ tower = "0.5"
 
 [features]
 default = []
-mcp-gateway = ["hyper", "tower", "bytes", "http-body"]
-http-gateway = ["hyper", "tower", "bytes", "http-body"]
+mcp-gateway = ["hyper"]
+http-gateway = ["hyper"]
 sqlite-sessions = ["sqlx", "tokio-stream"]
