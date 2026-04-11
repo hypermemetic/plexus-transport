@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "s01-schemars-extension",
+    "s02-derive-two-impls",
+    "s03-required-field-gate",
+    "s04-plexus-request-field",
+    "s05-macro-parse-request",
+    "s06-activation-param-strip",
+    "s07-request-schema-in-plugin",
+    "s08-option-vs-required",
+    "s09-no-request-backward-compat",
+]
