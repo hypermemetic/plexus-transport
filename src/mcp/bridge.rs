@@ -315,7 +315,7 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                 method_name
             };
             self.activation
-                .call(method, arguments_value, None)
+                .call(method, arguments_value, None, None)
                 .await
                 .map_err(plexus_to_mcp_error)?
         };

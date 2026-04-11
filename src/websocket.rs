@@ -130,55 +130,31 @@ mod auth {
             }
 
             // Extract and validate session if validator is configured.
-            // Tries in order: Cookie header, then ?token= query parameter.
+            // Tokens MUST be carried in the Cookie header — query parameters are
+            // rejected because they leak to logs, browser history, and Referer headers.
             let session_validator = self.session_validator.clone();
             if let Some(validator) = session_validator {
-                // Collect the cookie string and/or token query param
                 let cookie_str = request.headers()
                     .get(http::header::COOKIE)
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
 
-                let query_token = request.uri().query().and_then(|q| {
-                    form_urlencoded::parse(q.as_bytes())
-                        .find(|(k, _)| k == "token")
-                        .map(|(_, v)| v.to_string())
-                });
-
-                if cookie_str.is_some() || query_token.is_some() {
+                if let Some(cookies) = cookie_str {
                     let mut service = service;
                     return Box::pin(async move {
-                        let mut auth_ctx = None;
-
-                        // Try cookie first
-                        if let Some(ref cookies) = cookie_str {
-                            auth_ctx = validator.validate(cookies).await;
-                            if auth_ctx.is_some() {
-                                tracing::debug!("Cookie validation successful");
-                            }
-                        }
-
-                        // Fall back to ?token= query parameter
-                        if auth_ctx.is_none() {
-                            if let Some(ref token) = query_token {
-                                auth_ctx = validator.validate(token).await;
-                                if auth_ctx.is_some() {
-                                    tracing::debug!("Token query param validation successful");
-                                }
-                            }
-                        }
+                        let auth_ctx = validator.validate(&cookies).await;
 
                         if let Some(ctx) = auth_ctx {
                             tracing::debug!("Auth resolved for user: {}", ctx.user_id);
                             request.extensions_mut().insert(Arc::new(ctx));
                         } else {
-                            tracing::debug!("No valid auth found, proceeding without");
+                            tracing::debug!("Cookie present but validation failed, proceeding without auth");
                         }
 
                         service.call(request).await.map_err(Into::into)
                     });
                 }
-                tracing::debug!("No cookie or token query param, proceeding without auth");
+                tracing::debug!("No cookie present, proceeding without auth");
             }
 
             // No auth configured - pass through
