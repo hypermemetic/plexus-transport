@@ -3,7 +3,7 @@
 **blocked_by:** [REQ-2]
 **unlocks:** []
 
-## Status: Planned
+## Status: Complete
 
 ## Goal
 

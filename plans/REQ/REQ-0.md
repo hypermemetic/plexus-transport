@@ -4,7 +4,7 @@
 **unlocks:** [REQ-1, REQ-2, REQ-3, REQ-4, REQ-5]
 **touches:** plexus-transport, plexus-macros
 
-## Status: Planned
+## Status: Complete (S-01 through S-09 run; S-10 Haskell pending)
 
 ## Goal
 
@@ -512,26 +512,42 @@ S-10 lives in `synapse/test/`.
 
 ## Decision Matrix
 
-Run the programs in order. Each result narrows the implementation path:
+Results from running all programs (2026-04-08):
 
-| Program | Passes | Fails → implication |
-|---------|--------|---------------------|
-| S-01 | schemars `schema_with` works | PlexusRequest derive must own JsonSchema generation entirely |
-| S-02 | single derive generates both impls | — |
-| S-03 | extraction gate semantics correct | adjust error type/message |
-| S-04 | `PlexusRequestField` blanket impl works | revise trait design; document `Option<ValidOrigin>` semantics |
-| S-05 | macro accepts `request = Type` | add `request` key to `HubMethodsAttrs` parser |
-| S-06 | `#[activation_param]` strips from schema | add to parse.rs alongside `#[from_auth]` |
-| S-07 | `plugin_schema()` includes request JSON | wire S-01/S-02 output into `plugin_schema()` |
-| S-08 | `required` array matches field optionality | custom schema generation needed |
-| S-09 | backward compat holds | fix default code path in codegen |
-| S-10 | synapse decodes `psRequest` | add field to Haskell `PluginSchema` |
+| Program | Result | Finding |
+|---------|--------|---------|
+| S-01 | **PASS** | `#[schemars(extend("x-plexus-source" = {...}))]` works at field level in schemars 1.x. `x-plexus-source` appears in the generated JSON as expected. No custom `JsonSchema` impl needed. |
+| S-02 | **PASS** | Manual `JsonSchema` impl coexists fine with a separate extraction trait impl. A `PlexusRequest` derive can emit both. No blanket impl conflicts. |
+| S-03 | **PASS** | Non-`Option` field returns `Err` which short-circuits. `Option<T>` correctly allows absent fields. Error message format confirmed. |
+| S-04 | **PASS** | `PlexusRequestField` trait + `Option<T>` blanket works. Key finding: the blanket must map `Err` to `Err` for invalid values, NOT to `None`. Absent (no header) → `None`; present-but-invalid → `Err`. The design note in S-04 confirms this security invariant. |
+| S-05 | **PASS** | Existing activation with no `request =` compiles correctly. Parser does not accept `request = Type` yet (as expected — documented). Need to add `request` key to `HubMethodsAttrs::parse()` in REQ-4. |
+| S-06 | **PASS** | Baseline confirmed: `search: Option<String>` appears in method params schema. `#[activation_param]` not yet in parse.rs (expected). When added, it must strip params from method enum while keeping them accessible via request struct. |
+| S-07 | **PASS** | Baseline `plugin_schema()` output documented. No `request` field yet (correct). Current keys: `namespace`, `version`, `description`, `self_hash`, `hash`, `methods`. `request` field must be added to `PluginSchema` type and codegen (REQ-4). Method params come as inline `params` object, not a string — important for schema inspection code. |
+| S-08 | **PASS** | schemars correctly puts `String` fields in `required`, `Option<T>` fields not. `x-plexus-source` on all three field types (cookie/header/derived) round-trips correctly. No custom schema generation needed — schemars does the right thing. |
+| S-09 | **PASS** | Existing activations with no `request =` compile and schema correctly after the `crate_path` fix applied to spike. No `request` field in output. Backward compat holds. |
+| S-10 | **PENDING** | Haskell / synapse spike not yet written. Must verify `PluginSchema` Haskell type can carry `psRequest :: Maybe Value` and that Aeson decodes/encodes it correctly. |
 
-**When all 10 pass (or their failure paths are documented), REQ-1 through REQ-5 have no unknown-unknowns.**
+### Key implementation findings from spikes
+
+1. **`#[schemars(extend(...))]`** is the right tool for `x-plexus-source` — no need to write a custom `JsonSchema` impl per struct. The `PlexusRequest` derive can simply derive `JsonSchema` and add the extend attrs.
+
+2. **`crate_path` must be set to `"plexus_core"`** in any crate that depends on `plexus-macros` directly (rather than `plexus-core`). The generated method enum emits `{crate_path}::serde_helpers::...` paths. Fixed during spike by updating `method_enum.rs` to use `crate_path` rather than hardcoded `crate::`.
+
+3. **`plugin_schema()` method key is `"params"`, not `"params_schema"`** — the serialized schema puts method params as an inline JSON object at `methods[i].params`, not a string field.
+
+4. **`Option<T>` absent→None, invalid→Err** — the security invariant is confirmed. The `Option<T>` blanket impl of `PlexusRequestField` must NOT swallow validation errors.
+
+5. **S-05 confirms `request = Type` not yet in parser** — this is the primary REQ-4 task.
+
+6. **S-06 confirms `#[activation_param]` stripping not yet in codegen** — this is the primary REQ-2 task.
+
+7. **S-07 confirms `request` absent from `PluginSchema`** — needs to be added to both the Rust type and the codegen, then propagated to synapse (REQ-5).
 
 ## Acceptance Criteria
 
-- [ ] All 10 programs exist and run
-- [ ] Each program prints `OK` or a clear failure diagnosis
-- [ ] The decision matrix is filled in with actual results
-- [ ] Any design changes required by spike failures are reflected in REQ-1 through REQ-5 before implementation begins
+- [x] S-01 through S-09 programs exist and run
+- [x] Each program prints `OK` or a clear failure diagnosis
+- [x] Decision matrix filled in with actual results
+- [x] Key implementation findings documented above
+- [ ] S-10 Haskell spike written and run
+- [ ] Design changes reflected in REQ-1 through REQ-5

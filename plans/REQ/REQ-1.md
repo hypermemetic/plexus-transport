@@ -4,7 +4,7 @@
 **epic:** REQ
 **unlocks:** [REQ-2, REQ-3, REQ-4]
 
-## Status: Planned
+## Status: Complete
 
 ## Goal
 
