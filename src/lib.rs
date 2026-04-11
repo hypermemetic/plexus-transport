@@ -30,6 +30,8 @@
 //! # }
 //! ```
 
+pub mod request;
+
 #[cfg(feature = "mcp-gateway")]
 pub mod combined;
 pub mod config;
@@ -55,6 +57,7 @@ pub use config::{McpHttpConfig, SessionStorage, StdioConfig, TransportConfig, We
 pub use config::RestHttpConfig;
 
 pub use server::{TransportServer, TransportServerBuilder};
+pub use request::{ValidOrigin, init_allowed_origins};
 
 // Re-export MCP bridge for advanced usage
 #[cfg(feature = "sqlite-sessions")]
