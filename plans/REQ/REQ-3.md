@@ -2,8 +2,7 @@
 
 **blocked_by:** [REQ-2]
 **unlocks:** []
-
-## Status: Complete
+**status:** Complete
 
 ## Goal
 

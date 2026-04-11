@@ -1,10 +1,9 @@
 # REQ-0: Spike — Validate Core Design Decisions Before Implementation
 
 **blocked_by:** []
-**unlocks:** [REQ-1, REQ-2, REQ-3, REQ-4, REQ-5]
-**touches:** plexus-transport, plexus-macros
-
-## Status: Complete (S-01 through S-09 run; S-10 Haskell pending)
+**unlocks:** [REQ-1, REQ-2, REQ-3, REQ-4, REQ-5, REQ-6, REQ-7]
+**touches:** plexus-transport, plexus-macros, plexus-protocol, synapse, synapse-cc
+**status:** Complete
 
 ## Goal
 

@@ -1,14 +1,27 @@
 # REQ-5: Synapse Support for Hub Request Schemas
 
 **blocked_by:** [REQ-4]
-**unlocks:** []
+**unlocks:** [REQ-7]
 **touches:** plexus-protocol, synapse
-
-## Status: Planned
+**status:** Ready
 
 ## Goal
 
 Synapse reads the `psRequest` JSON Schema blob from `PluginSchema`, shows auth requirements and request fields in help output, proactively warns when required fields aren't configured, and provides `--cookie`/`--header`/`--query` flags and environment variable shorthands to satisfy those requirements. The wire format change is minimal: one new field (`request: Maybe Value`) on `PluginSchema`.
+
+## Coordination with REQ-6
+
+REQ-6 (per-method `x-plexus-source` annotations on `MethodSchema.params`)
+is a parallel framework change. REQ-5 surfaces the **activation-level**
+request struct in synapse help. REQ-6 surfaces the **per-method**
+auth/derived params. Both use the same `x-plexus-source` vocabulary.
+
+REQ-5 can ship without REQ-6 — it covers the "this whole activation
+needs auth" case which is what FormVeritas uses today via
+`request = FormVeritasRequest`. After REQ-6 also lands, REQ-5's
+`renderPluginHelp` can be extended to walk per-method `params` and
+render auth annotations there too. That extension is a follow-up
+inside REQ-5, not a blocker.
 
 ## What Changes in the Wire Format
 

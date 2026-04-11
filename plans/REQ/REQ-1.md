@@ -3,8 +3,7 @@
 **blocked_by:** [REQ-0]
 **epic:** REQ
 **unlocks:** [REQ-2, REQ-3, REQ-4]
-
-## Status: Complete
+**status:** Complete
 
 ## Goal
 
