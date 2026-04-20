@@ -7,7 +7,7 @@ description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
 
 [dependencies]
 # Core dependencies
-plexus-core = { path = "../plexus-core", version = "0.4" }
+plexus-core = { path = "../plexus-core", version = "0.5" }
 tokio = { version = "1.42", features = ["full"] }
 futures = "0.3"
 async-stream = "0.3"
@@ -48,7 +48,7 @@ tower = "0.5"
 # with PlexusRequest's generated impl. All real schemars types/macros are re-exported.
 schemars = { path = "../plexus-schemars-compat", package = "plexus-schemars-compat" }
 plexus-macros = { path = "../plexus-macros" }
-plexus-core = { path = "../plexus-core", version = "0.4" }
+plexus-core = { path = "../plexus-core", version = "0.5" }
 
 [features]
 default = []
